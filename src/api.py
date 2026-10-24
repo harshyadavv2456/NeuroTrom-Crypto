@@ -460,12 +460,17 @@ def generate_predictions(horizon: str = "24h", source_mode: Optional[str] = None
                     continue
 
             cutoff_timestamp = pd.Timestamp(price_row["timestamp"]).to_pydatetime()
+            provenance_path = MODELS / f"crypto_{horizon}_provenance.json"
+            try:
+                trained_at = json.loads(provenance_path.read_text()).get("saved_at", "unknown")
+            except (OSError, ValueError, TypeError):
+                trained_at = "unknown"
             record_prediction(
                 symbol=symbol,
                 horizon=horizon,
                 timestamp=datetime.now(timezone.utc),
                 predicted_return=float(score),
-                model_version=f"crypto_{horizon}",
+                model_version=f"crypto_{horizon}@{trained_at}",
                 feature_version="v1",
                 price=price,
                 source_mode=src,
