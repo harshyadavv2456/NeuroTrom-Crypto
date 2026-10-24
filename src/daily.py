@@ -104,7 +104,7 @@ def main():
     with history_path.open("a", encoding="utf-8") as history:
         history.write(json.dumps({"started": started, "finished": finished, "ok": ok,
                                   "steps": {step["step"]: step.get("ok", False) for step in steps}},
-                                 default=str) + "\\n")
+                                 default=str) + "\n")
     
     log.info("=== Daily pipeline finished %s: %s ===", finished, "OK" if ok else "FAILED")
     return 0 if ok else 1
