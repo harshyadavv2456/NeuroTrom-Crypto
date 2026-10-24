@@ -53,9 +53,9 @@ def backfill_universe(intervals: list[str] = None, universe_limit: int = 60, day
     tasks = []
     target_records = list(df.head(universe_limit).iterrows())
     target_providers = {str(record.get("exchange", "binance")).lower() for _, record in target_records}
-    # Keep public REST load conservative for Kraken; its OHLC endpoint has a
-    # strict 720-candle window and should not be hammered with concurrent loops.
-    worker_count = 1 if target_providers == {"kraken"} else min(2, MAX_BACKFILL_CONCURRENCY)
+    # Keep public REST load conservative for Kraken and CoinDCX. CoinDCX's
+    # public API caps requests per second; one worker avoids backfill bursts.
+    worker_count = 1 if target_providers.intersection({"kraken", "coindcx"}) else min(2, MAX_BACKFILL_CONCURRENCY)
 
     # Schedule provider-specific work. Demo symbols are deliberately not backfilled.
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
