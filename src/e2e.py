@@ -33,7 +33,7 @@ REAL_MODES = {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"}
 def check(layer: str, name: str, fn):
     started = time.monotonic()
     try:
-        result = fn()
+        result = fn() if callable(fn) else fn
         ok, detail = result if isinstance(result, tuple) else (True, str(result))
     except Exception as exc:
         ok, detail = False, f"{type(exc).__name__}: {str(exc)[:250]}"
