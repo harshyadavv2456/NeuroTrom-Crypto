@@ -127,6 +127,7 @@ def verify_backfill(symbol: str, interval: str, market_type: str = "spot") -> di
     else:
         gap_pct = 0
     
+    source = df["source_mode"].iloc[0] if "source_mode" in df.columns and not df.empty else "unknown"
     return {
         "status": "ok" if age_hours < 3 else "stale",
         "rows": len(df),
@@ -135,6 +136,7 @@ def verify_backfill(symbol: str, interval: str, market_type: str = "spot") -> di
         "age_hours": round(age_hours, 1),
         "gap_pct": round(gap_pct, 2),
         "market": market_type,
+        "source_mode": source,
     }
 
 

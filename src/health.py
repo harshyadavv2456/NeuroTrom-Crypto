@@ -84,12 +84,17 @@ def main() -> int:
             elif not live_df.empty:
                 last_ts = live_df["timestamp"].max().to_pydatetime()
             
-            age_h = (now - last_ts).total_seconds() / 3600 if last_ts else 1e9
-            stale = age_h > (4 if interval == "1h" else 48)
-            
+            if last_ts:
+                age_h = (now - last_ts).total_seconds() / 3600
+                stale = age_h > (4 if interval == "1h" else 48)
+                last_str = last_ts.isoformat()[:19]
+            else:
+                age_h = 1e9
+                stale = True
+                last_str = "no exchange timestamp (synthetic)"
             source_label = "REAL" if has_real else "SYNTHETIC"
             bad.append(not check(f"{interval} data ({source_label})", not stale, 
-                                f"{len(real_df) + len(live_df) + len(synth_df)} rows, age {age_h:.1f}h, last {last_ts.isoformat()[:19] if last_ts else 'none'}"))
+                                f"{len(real_df) + len(live_df) + len(synth_df)} rows, age {age_h:.1f}h, last {last_str}"))
     
     # 5. Model readiness
     model_provenances = []
