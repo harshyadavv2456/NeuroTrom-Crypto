@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import requests
 import websockets
+from http_client import http_get
 
 from config import DATA, HISTORY_INTERVALS, FINE_GRAIN_INTERVALS, FINE_GRAIN_UNIVERSE_SIZE, MAX_BACKFILL_CONCURRENCY, MAX_LIVE_CONCURRENCY, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
 from sources import get_source, approved_sources
@@ -58,7 +59,7 @@ def rest_klines(symbol: str, interval: str, start_ms: Optional[int] = None, end_
     if end_ms is not None:
         params["endTime"] = end_ms
     
-    r = requests.get(url, params=params, timeout=30)
+    r = http_get(url, params=params, timeout=30)
     r.raise_for_status()
     raw = r.json()
     
@@ -140,7 +141,10 @@ def get_candles(symbol: str, interval: str, market_type: str = "spot", start: Op
         return pd.DataFrame()
     df = pd.read_parquet(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    if source_mode is not None and "source_mode" in df.columns:
+    if source_mode is not None:
+        # A provenance-filtered read must never return unprovenanced legacy rows.
+        if "source_mode" not in df.columns:
+            return pd.DataFrame()
         df = df[df["source_mode"] == source_mode]
     if start:
         df = df[df["timestamp"] >= pd.Timestamp(start, tz="UTC")]
@@ -158,37 +162,99 @@ def get_last_timestamp(symbol: str, interval: str, market_type: str = "spot", so
 
 # ---- Kraken REST OHLCV ----
 
-def kraken_ohlc(pair: str, interval: int = 60, since: Optional[int] = None) -> pd.DataFrame:
-    """Fetch OHLC from Kraken public API."""
+_KRAKEN_PAIRS_CACHE: list[dict] | None = None
+_KRAKEN_PAIRS_CACHE_AT = 0.0
+
+
+def _normalise_asset(value: str) -> str:
+    value = str(value).upper().strip()
+    return "BTC" if value == "XBT" else value
+
+
+def _symbol_parts(symbol: str) -> tuple[str, str]:
+    clean = str(symbol).upper().replace("/", "").replace("-", "")
+    for quote in ("USDT", "USDC", "USD", "EUR", "GBP"):
+        if clean.endswith(quote) and len(clean) > len(quote):
+            return _normalise_asset(clean[:-len(quote)]), _normalise_asset(quote)
+    raise ValueError(f"Unsupported Kraken symbol format: {symbol}")
+
+
+def kraken_asset_pairs(refresh: bool = False) -> list[dict]:
+    """Return Kraken's current pair metadata with a short in-process cache."""
+    global _KRAKEN_PAIRS_CACHE, _KRAKEN_PAIRS_CACHE_AT
+    if not refresh and _KRAKEN_PAIRS_CACHE is not None and time.time() - _KRAKEN_PAIRS_CACHE_AT < 900:
+        return _KRAKEN_PAIRS_CACHE
+    response = http_get(f"{KRAKEN_REST}/AssetPairs", timeout=15)
+    data = response.json()
+    if data.get("error"):
+        raise ValueError(f"Kraken AssetPairs error: {data['error']}")
+    result = data.get("result", {})
+    _KRAKEN_PAIRS_CACHE = [dict(pair_key=key, **value) for key, value in result.items() if isinstance(value, dict)]
+    _KRAKEN_PAIRS_CACHE_AT = time.time()
+    return _KRAKEN_PAIRS_CACHE
+
+
+def resolve_kraken_pair(symbol: str) -> str:
+    """Resolve an internal symbol to an exact Kraken pair; never silently change quote currency."""
+    if "/" in str(symbol):
+        wanted_base, wanted_quote = (_normalise_asset(x) for x in str(symbol).split("/", 1))
+    else:
+        wanted_base, wanted_quote = _symbol_parts(symbol)
+    for pair in kraken_asset_pairs():
+        wsname = str(pair.get("wsname", ""))
+        if "/" not in wsname:
+            continue
+        base, quote = (_normalise_asset(x) for x in wsname.split("/", 1))
+        if base == wanted_base and quote == wanted_quote and pair.get("status", "online") == "online":
+            return str(pair.get("altname") or pair.get("pair_key"))
+    raise ValueError(f"Kraken has no active exact-quote pair for {symbol}")
+
+
+def kraken_ohlc(pair: str, interval: int = 60, since: Optional[int] = None,
+                symbol: Optional[str] = None, interval_label: Optional[str] = None) -> pd.DataFrame:
+    """Fetch completed Kraken OHLC candles for an exact exchange pair.
+
+    Kraken's OHLC endpoint returns at most 720 recent rows and includes the
+    currently forming candle; discard the unfinished row and report actual coverage.
+    """
+    resolved_pair = resolve_kraken_pair(pair)
     url = f"{KRAKEN_REST}/OHLC"
-    params = {"pair": pair, "interval": interval}
+    params = {"pair": resolved_pair, "interval": interval}
     if since is not None:
         params["since"] = since
-    
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    
+
+    response = http_get(url, params=params, timeout=30)
+    data = response.json()
     if data.get("error"):
         raise ValueError(f"Kraken error: {data['error']}")
-    
+
     result = data.get("result", {})
-    # Kraken returns data with the pair name as key, and a 'last' field
-    pair_key = [k for k in result.keys() if k != "last"]
-    if not pair_key:
+    pair_keys = [key for key in result.keys() if key != "last"]
+    if not pair_keys:
         return pd.DataFrame()
-    
-    raw = result[pair_key[0]]
-    cols = ["time", "open", "high", "low", "close", "vwap", "volume", "count"]
+
+    raw = result[pair_keys[0]]
+    cols = ["open_time", "open", "high", "low", "close", "vwap", "volume", "count"]
     df = pd.DataFrame(raw, columns=cols)
-    for c in ["open", "high", "low", "close", "volume", "vwap"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df["symbol"] = pair
-    df["interval"] = f"{interval // 60}h" if interval >= 60 else f"{interval}m"
+    if df.empty:
+        return df
+    for col in ["open", "high", "low", "close", "volume", "vwap"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="s", utc=True)
+    df["close_time"] = df["open_time"] + pd.to_timedelta(interval, unit="m")
+    df = df[df["close_time"] <= pd.Timestamp.now(tz="UTC")].copy()
+    if df.empty:
+        return df
+    df["symbol"] = str(symbol or pair).replace("/", "").replace("-", "").upper()
+    inferred = {1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "1h",
+                240: "4h", 1440: "1d", 10080: "7d", 21600: "15d"}.get(interval, f"{interval}m")
+    df["interval"] = interval_label or inferred
     df["market"] = "spot"
     df["exchange"] = "kraken"
-    df = _add_provenance(df, SOURCE_HISTORICAL, "kraken")
+    df["trades"] = pd.to_numeric(df["count"], errors="coerce")
+    df["ingested_at"] = _now_iso()
+    df["source_mode"] = SOURCE_HISTORICAL
+    df["provider"] = "kraken"
     return df
 
 
@@ -224,12 +290,20 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
             if provider == "binance":
                 df = rest_klines(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=batch, market_type=market_type)
             elif provider == "kraken":
-                # Kraken interval is in minutes
-                kraken_interval = 60 if interval == "1h" else 1440 if interval == "1d" else 60
-                df = kraken_ohlc(symbol, interval=kraken_interval, since=start_ms // 1000)
+                # Kraken OHLC supports only the latest 720 candles per interval.
+                interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                                    "1h": 60, "4h": 240, "1d": 1440, "7d": 10080}
+                if interval not in interval_minutes:
+                    raise ValueError(f"Unsupported Kraken candle interval: {interval}")
+                kraken_interval = interval_minutes[interval]
+                effective_start = max(cur, end - pd.Timedelta(minutes=kraken_interval * 720))
+                pair_name = resolve_kraken_pair(symbol)
+                df = kraken_ohlc(pair_name, interval=kraken_interval,
+                                  since=int(effective_start.timestamp()),
+                                  symbol=symbol, interval_label=interval)
                 if not df.empty:
-                    # Filter to requested range
-                    df = df[(df["time"] >= pd.Timestamp(cur, tz="UTC")) & (df["time"] <= pd.Timestamp(end, tz="UTC"))]
+                    df = df[(df["open_time"] >= pd.Timestamp(effective_start)) &
+                            (df["open_time"] <= pd.Timestamp(end))]
             else:
                 raise ValueError(f"Unknown provider: {provider}")
             
@@ -323,7 +397,7 @@ def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binanc
     if provider == "binance":
         base = BINANCE_REST if market_type == "spot" else BINANCE_FUTURES_REST
         url = f"{base}/api/v3/ticker/24hr" if market_type == "spot" else f"{base}/fapi/v1/ticker/24hr"
-        r = requests.get(url, params={"symbol": symbol}, timeout=3)
+        r = http_get(url, params={"symbol": symbol}, timeout=3)
         r.raise_for_status()
         d = r.json()
         return {
@@ -339,7 +413,7 @@ def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binanc
         }
     elif provider == "kraken":
         url = f"{KRAKEN_REST}/Ticker"
-        r = requests.get(url, params={"pair": symbol}, timeout=3)
+        r = http_get(url, params={"pair": resolve_kraken_pair(symbol)}, timeout=3)
         r.raise_for_status()
         data = r.json()
         if data.get("error"):
@@ -368,14 +442,19 @@ def test_provider_connectivity(provider: str = "binance") -> dict:
     """Test connectivity to a provider."""
     if provider == "binance":
         try:
-            r = requests.get(f"{BINANCE_REST}/api/v3/ping", timeout=3)
-            return {"provider": "binance", "reachable": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
+            t0 = time.monotonic()
+            r = http_get(f"{BINANCE_REST}/api/v3/ping", timeout=4)
+            return {"provider": "binance", "reachable": r.status_code == 200, "latency_ms": round((time.monotonic() - t0) * 1000, 1), "transport": r.headers.get("X-NeuroTrom-Transport", "requests")}
         except Exception as e:
             return {"provider": "binance", "reachable": False, "error": str(e)}
     elif provider == "kraken":
         try:
-            r = requests.get(f"{KRAKEN_REST}/Time", timeout=3)
-            return {"provider": "kraken", "reachable": r.status_code == 200, "latency_ms": r.elapsed.total_seconds() * 1000}
+            t0 = time.monotonic()
+            r = http_get(f"{KRAKEN_REST}/Time", timeout=4)
+            data = r.json()
+            if data.get("error"):
+                raise ValueError(f"Kraken error: {data['error']}")
+            return {"provider": "kraken", "reachable": r.status_code == 200, "latency_ms": round((time.monotonic() - t0) * 1000, 1), "transport": r.headers.get("X-NeuroTrom-Transport", "requests")}
         except Exception as e:
             return {"provider": "kraken", "reachable": False, "error": str(e)}
     else:
