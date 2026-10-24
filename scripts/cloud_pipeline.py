@@ -356,28 +356,53 @@ def parse_compatible_kaggle_csvs(folder: Path) -> dict[str, pd.DataFrame]:
 
 
 def add_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Compute lagged features without allowing a time gap to bridge two bars."""
     df = frame.sort_values("timestamp").copy()
-    close = pd.to_numeric(df["close"], errors="coerce")
-    volume = pd.to_numeric(df["volume"], errors="coerce").clip(lower=0)
-    log_close = np.log(close.where(close > 0))
-    features = pd.DataFrame(index=df.index)
-    for lag in (1, 2, 4, 8, 24, 48, 168):
-        features[f"ret_{lag}"] = close.pct_change(lag)
-        features[f"logret_{lag}"] = log_close.diff(lag)
-    for window in (12, 24, 72, 168):
-        features[f"volatility_{window}"] = log_close.diff().rolling(window).std()
-        features[f"ma_gap_{window}"] = close / close.rolling(window).mean() - 1
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    features["rsi_14"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-    features["range_pct"] = (df["high"] - df["low"]) / close.replace(0, np.nan)
-    features["body_pct"] = (df["close"] - df["open"]) / close.replace(0, np.nan)
-    features["volume_log_change"] = np.log1p(volume).diff()
-    features["hour_utc"] = pd.to_datetime(df["timestamp"], utc=True).dt.hour
-    features["day_utc"] = pd.to_datetime(df["timestamp"], utc=True).dt.dayofweek
-    features["symbol"] = df["symbol"].astype(str)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    # A large gap (including a jump from old Kaggle history into the recent API
+    # window) starts a fresh segment; lag/rolling features reset at that boundary.
+    segments = df["timestamp"].diff().ne(pd.Timedelta(hours=1)).cumsum()
+    parts = []
+    for _, group in df.groupby(segments, sort=False):
+        close = pd.to_numeric(group["close"], errors="coerce")
+        volume = pd.to_numeric(group["volume"], errors="coerce").clip(lower=0)
+        log_close = np.log(close.where(close > 0))
+        features = pd.DataFrame(index=group.index)
+        for lag in (1, 2, 4, 8, 24, 48, 168):
+            features[f"ret_{lag}"] = close.pct_change(lag, fill_method=None)
+            features[f"logret_{lag}"] = log_close.diff(lag)
+        for window in (12, 24, 72, 168):
+            features[f"volatility_{window}"] = log_close.diff().rolling(window).std()
+            features[f"ma_gap_{window}"] = close / close.rolling(window).mean() - 1
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        features["rsi_14"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+        high = pd.to_numeric(group["high"], errors="coerce")
+        low = pd.to_numeric(group["low"], errors="coerce")
+        open_ = pd.to_numeric(group["open"], errors="coerce")
+        features["range_pct"] = (high - low) / close.replace(0, np.nan)
+        features["body_pct"] = (close - open_) / close.replace(0, np.nan)
+        features["volume_log_change"] = np.log1p(volume).diff()
+        features["hour_utc"] = group["timestamp"].dt.hour
+        features["day_utc"] = group["timestamp"].dt.dayofweek
+        features["symbol"] = group["symbol"].astype(str)
+        parts.append(features)
+    if not parts:
+        return pd.DataFrame(index=df.index)
+    features = pd.concat(parts).sort_index()
     return features.replace([np.inf, -np.inf], np.nan)
+
+
+def add_horizon_label(frame: pd.DataFrame, bars: int) -> pd.Series:
+    """Return future-close labels only when every intervening hourly bar exists."""
+    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    future_time = timestamps.shift(-bars)
+    future_close = close.shift(-bars)
+    label = future_close / close - 1
+    contiguous = (future_time - timestamps) == pd.Timedelta(hours=bars)
+    return label.where(contiguous)
 
 
 def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tuple[dict, list[dict]]:
@@ -389,7 +414,7 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
         frame = frame.drop_duplicates("timestamp").sort_values("timestamp").copy()
         features = add_features(frame)
         for horizon, bars in HORIZONS.items():
-            features[f"label_{horizon}"] = frame["close"].shift(-bars) / frame["close"] - 1
+            features[f"label_{horizon}"] = add_horizon_label(frame, bars)
         combined = frame[["timestamp", "symbol", "close", "source"]].join(features.drop(columns=["symbol"]))
         training_rows.append(combined)
         valid = features.drop(columns=[f"label_{h}" for h in HORIZONS]).dropna()
