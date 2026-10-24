@@ -42,7 +42,7 @@ def discover_binance_universe(market_type: str = "spot", quote_asset: str = "USD
     url = f"{base_url}/api/v3/exchangeInfo" if market_type == "spot" else f"{base_url}/fapi/v1/exchangeInfo"
     
     log.info("Fetching Binance %s exchange info...", market_type)
-    r = http_get(url, timeout=30)
+    r = http_get(url, timeout=8)
     r.raise_for_status()
     info = r.json()
     
@@ -111,31 +111,39 @@ def discover_kraken_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.
     return df
 
 
-def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = True) -> pd.DataFrame:
-    """Build a real exchange-derived universe when possible; mark offline fixtures explicitly."""
+def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = True,
+                   preferred_exchange: Optional[str] = None) -> pd.DataFrame:
+    """Build a real exchange-derived universe; synthetic symbols remain demo-only."""
     selected_source = "SYNTHETIC_DEMO"
     spot = pd.DataFrame()
 
-    try:
-        spot = discover_binance_universe("spot", "USDT", limit=max_symbols * 2)
-        if not spot.empty:
-            selected_source = "BINANCE_EXCHANGE_INFO"
-            spot["universe_source"] = selected_source
-            spot["universe_provenance"] = SOURCE_HISTORICAL
-    except Exception as exc:
-        log.warning("Binance universe unavailable: %s", exc)
+    preferred = str(preferred_exchange or "").lower()
+    order = [preferred] if preferred in {"binance", "kraken"} else []
+    order += [name for name in ("binance", "kraken") if name not in order]
 
-    if spot.empty:
-        # Use exact-quote USDT if available; otherwise use real USD pairs. Never rename
-        # a BTC/USD market as BTC/USDT just to preserve a synthetic symbol convention.
-        for quote in ("USDT", "USD"):
+    for exchange in order:
+        if not spot.empty:
+            break
+        if exchange == "binance":
             try:
-                spot = discover_kraken_universe(quote, limit=max_symbols * 2)
+                spot = discover_binance_universe("spot", "USDT", limit=max_symbols * 2)
                 if not spot.empty:
-                    selected_source = f"KRAKEN_ASSET_PAIRS_{quote}"
-                    break
+                    selected_source = "BINANCE_EXCHANGE_INFO"
+                    spot["universe_source"] = selected_source
+                    spot["universe_provenance"] = SOURCE_HISTORICAL
             except Exception as exc:
-                log.warning("Kraken %s universe unavailable: %s", quote, exc)
+                log.warning("Binance universe unavailable: %s", exc)
+        elif exchange == "kraken":
+            # Prefer USDT instruments where actually listed; otherwise keep the
+            # genuine USD quote and preserve that symbol as the canonical instrument.
+            for quote in ("USDT", "USD"):
+                try:
+                    spot = discover_kraken_universe(quote, limit=max_symbols * 2)
+                    if not spot.empty:
+                        selected_source = f"KRAKEN_ASSET_PAIRS_{quote}"
+                        break
+                except Exception as exc:
+                    log.warning("Kraken %s universe unavailable: %s", quote, exc)
 
     if spot.empty:
         rows = []
@@ -179,7 +187,6 @@ def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = Tru
 
     log.info("Universe saved: %d symbols from %s", len(selected), selected_source)
     return selected
-
 
 def load_universe() -> pd.DataFrame:
     """Load the current universe from disk."""
