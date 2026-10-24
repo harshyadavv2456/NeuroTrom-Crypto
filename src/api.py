@@ -252,6 +252,7 @@ def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200,
         raise HTTPException(400, "Synthetic candles require allow_synthetic=true and are demo-only")
 
     actual_symbol = symbol
+    actual_provider = None
     if source_mode:
         df = get_candles(symbol, interval, "spot", source_mode=source_mode)
     else:
@@ -264,7 +265,7 @@ def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200,
         else:
             resolved = _resolve_exchange_symbol(symbol)
             if resolved:
-                actual_symbol, chosen_provider = resolved
+                actual_symbol, actual_provider = resolved
                 frames = [get_candles(actual_symbol, interval, "spot", source_mode=mode)
                           for mode in (SOURCE_HISTORICAL, SOURCE_LIVE)]
                 frames = [frame for frame in frames if not frame.empty]
@@ -273,21 +274,31 @@ def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200,
                     df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
 
     if df.empty and source_mode in (None, SOURCE_HISTORICAL):
-        try:
-            raw = rest_klines(symbol, interval, limit=min(max(limit, 1), 1000))
-            if not raw.empty:
-                save_candles(raw, symbol, interval, "spot", source_mode=SOURCE_HISTORICAL, provider="binance")
-                df = get_candles(symbol, interval, "spot", source_mode=SOURCE_HISTORICAL)
-        except Exception as binance_error:
-            log.info("Binance candle request unavailable for %s: %s", symbol, binance_error)
-        if df.empty:
+        # If the primary symbol is not listed on the reachable exchange, use the
+        # universe's real instrument identifier and expose that identifier below.
+        if actual_provider is None:
+            resolved = _resolve_exchange_symbol(symbol)
+            if resolved:
+                actual_symbol, actual_provider = resolved
+
+        provider = actual_provider or "binance"
+        if provider == "binance":
+            try:
+                raw = rest_klines(actual_symbol, interval, limit=min(max(limit, 1), 1000))
+                if not raw.empty:
+                    save_candles(raw, actual_symbol, interval, "spot", source_mode=SOURCE_HISTORICAL, provider="binance")
+                    df = get_candles(actual_symbol, interval, "spot", source_mode=SOURCE_HISTORICAL)
+            except Exception as error:
+                log.info("Binance candle request unavailable for %s: %s", actual_symbol, error)
+        if df.empty and provider == "kraken":
             try:
                 now = datetime.now(timezone.utc)
                 lookback_days = 720 if interval == "1d" else 30
-                backfill_symbol(symbol, interval, now - pd.Timedelta(days=lookback_days), now, "spot", provider="kraken")
-                df = get_candles(symbol, interval, "spot", source_mode=SOURCE_HISTORICAL)
-            except Exception as kraken_error:
-                log.warning("Kraken candle request unavailable for %s: %s", symbol, kraken_error)
+                backfill_symbol(actual_symbol, interval, now - pd.Timedelta(days=lookback_days), now,
+                                "spot", provider="kraken")
+                df = get_candles(actual_symbol, interval, "spot", source_mode=SOURCE_HISTORICAL)
+            except Exception as error:
+                log.warning("Kraken candle request unavailable for %s: %s", actual_symbol, error)
 
     if df.empty and allow_synthetic:
         df = get_candles(symbol, interval, "spot", source_mode=SOURCE_SYNTHETIC)
@@ -429,15 +440,17 @@ def generate_predictions(horizon: str = "24h", source_mode: Optional[str] = None
                 if age_hours > 2.5:
                     continue
 
+            cutoff_timestamp = pd.Timestamp(price_row["timestamp"]).to_pydatetime()
             record_prediction(
                 symbol=symbol,
                 horizon=horizon,
-                timestamp=pd.Timestamp(price_row["timestamp"]).to_pydatetime(),
+                timestamp=datetime.now(timezone.utc),
                 predicted_return=float(score),
                 model_version=f"crypto_{horizon}",
                 feature_version="v1",
                 price=price,
                 source_mode=src,
+                data_cutoff_timestamp=cutoff_timestamp,
             )
             results.append({"symbol": symbol, "score": float(score), "price": price, "source_mode": src})
         
