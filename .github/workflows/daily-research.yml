@@ -48,11 +48,12 @@ jobs:
       - name: Install Kaggle CLI only when an input dataset is configured
         env:
           KAGGLE_INPUT_DATASET: ${{ vars.KAGGLE_INPUT_DATASET }}
+          KAGGLE_OUTPUT_DATASET: ${{ vars.KAGGLE_OUTPUT_DATASET }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
-          if [[ -n "$KAGGLE_INPUT_DATASET" && ( -n "$KAGGLE_API_TOKEN" || ( -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ) ) ]]; then
+          if [[ ( -n "$KAGGLE_INPUT_DATASET" || -n "$KAGGLE_OUTPUT_DATASET" ) && ( -n "$KAGGLE_API_TOKEN" || ( -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ) ) ]]; then
             uv pip install --python .venv/bin/python kaggle
             echo "Kaggle input configured; source freshness and license will be checked by the pipeline."
           elif [[ -n "$KAGGLE_INPUT_DATASET" ]]; then
@@ -82,6 +83,44 @@ jobs:
           fi
           # Always publish the current status report, even when data/model quality is degraded.
           exit 0
+
+      - name: Publish optional daily snapshot to an existing Kaggle output dataset
+        if: vars.KAGGLE_OUTPUT_PUBLISH == 'true' && vars.KAGGLE_OUTPUT_DATASET != ''
+        env:
+          KAGGLE_OUTPUT_DATASET: ${{ vars.KAGGLE_OUTPUT_DATASET }}
+          KAGGLE_INPUT_DATASET: ${{ vars.KAGGLE_INPUT_DATASET }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$KAGGLE_OUTPUT_DATASET" == "$KAGGLE_INPUT_DATASET" && -n "$KAGGLE_INPUT_DATASET" ]]; then
+            echo "::error::KAGGLE_OUTPUT_DATASET must be separate from the historical input dataset to avoid overwriting source data."
+            exit 1
+          fi
+          if [[ ! -s site/data/daily_update.csv ]]; then
+            echo "::error::No daily_update.csv was generated; will not publish an empty Kaggle version."
+            exit 1
+          fi
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          kaggle datasets metadata "$KAGGLE_OUTPUT_DATASET" -p "$tmp"
+          if [[ ! -s "$tmp/dataset-metadata.json" ]]; then
+            echo "::error::Kaggle metadata download failed."
+            exit 1
+          fi
+          python - "$tmp/dataset-metadata.json" "$KAGGLE_OUTPUT_DATASET" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          expected = sys.argv[2].strip().lower()
+          data = json.loads(path.read_text())
+          actual = str(data.get("id", "")).strip().lower()
+          if actual != expected:
+              raise SystemExit(f"Metadata dataset id mismatch: got {actual!r}, expected {expected!r}")
+          PY
+          cp site/data/daily_update.csv "$tmp/daily_update.csv"
+          kaggle datasets version -p "$tmp" -m "Automated market snapshot ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:8})" -q -t -r skip
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
