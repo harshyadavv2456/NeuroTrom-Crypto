@@ -125,16 +125,36 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
             log.warning("Could not read existing parquet %s: %s", raw_path, e)
             existing = pd.DataFrame()
     
+    existing_before = existing.copy()
     combined = _dedupe_candles(pd.concat([existing, df], ignore_index=True), "open_time")
-    
+
     bad = (combined["high"] < combined["low"]) | (combined["high"] < combined["open"]) | (combined["high"] < combined["close"]) | (combined["low"] > combined["open"]) | (combined["low"] > combined["close"])
-    before = len(combined)
     if bad.any():
         log.warning("Dropping %d invalid OHLC rows for %s %s", bad.sum(), symbol, interval)
         combined = combined[~bad]
-    written = len(combined) - (len(existing) if not existing.empty else 0)
-    if written < 0:
-        written = 0
+
+    # Count new observations and provenance upgrades, not just net file growth.
+    # A genuine candle replacing a synthetic candle is useful progress even if
+    # the total row count stays constant.
+    valid_keys = set(pd.to_datetime(combined["open_time"], utc=True, errors="coerce").dropna())
+    old_priorities = {}
+    if not existing_before.empty and "open_time" in existing_before.columns:
+        old_before = existing_before.copy()
+        old_before["open_time"] = pd.to_datetime(old_before["open_time"], utc=True, errors="coerce")
+        priority_map = {"SYNTHETIC_DEMO": 0, "HISTORICAL_EXCHANGE": 1, "LIVE_EXCHANGE": 2}
+        old_before["_priority"] = old_before.get("source_mode", pd.Series(index=old_before.index, dtype=str)).map(priority_map).fillna(-1)
+        old_priorities = dict(zip(old_before["open_time"], old_before["_priority"]))
+
+    new_input = df.copy()
+    new_input["open_time"] = pd.to_datetime(new_input["open_time"], utc=True, errors="coerce")
+    priority_map = {"SYNTHETIC_DEMO": 0, "HISTORICAL_EXCHANGE": 1, "LIVE_EXCHANGE": 2}
+    new_input["_priority"] = new_input.get("source_mode", pd.Series(index=new_input.index, dtype=str)).map(priority_map).fillna(-1)
+    new_input = new_input[new_input["open_time"].isin(valid_keys)].sort_values(["open_time", "_priority"])
+    new_input = new_input.drop_duplicates(subset=["open_time"], keep="last")
+    written = sum(
+        1 for _, item in new_input.iterrows()
+        if item["open_time"] not in old_priorities or item["_priority"] > old_priorities[item["open_time"]]
+    )
     
     combined.to_parquet(raw_path, index=False, engine="pyarrow")
     
