@@ -627,7 +627,7 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
                 "provider": provider,
             }))
             
-            time.sleep(0.05)
+            time.sleep(0.12 if provider == "coindcx" else 0.05)
             if provider == "kraken":
                 # Kraken only returns the newest 720 bars: a second page call would
                 # repeat the same window and can loop forever.
