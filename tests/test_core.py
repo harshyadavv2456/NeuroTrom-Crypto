@@ -102,7 +102,10 @@ def test_api_binds_localhost():
 
 def test_port_no_conflict_with_finvest():
     """Port 8775 must not be FinVest's port (8765, 8790)."""
+    import shutil
     import subprocess
+    if shutil.which("lsof") is None:
+        pytest.skip("lsof is unavailable on this runner")
     r = subprocess.run(["lsof", "-iTCP:8775", "-sTCP:LISTEN"], capture_output=True, text=True)
     if r.returncode == 0:
         out = r.stdout.lower()
