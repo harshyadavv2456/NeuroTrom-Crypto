@@ -1,150 +1,164 @@
-"""Health check for NeuroTrom Crypto — exits nonzero when required conditions fail."""
+"""Production health check for NeuroTrom Crypto.
+
+Exit 0 only when the real-data production path is usable. An API process being
+alive, or synthetic fixtures being fresh, is not sufficient for a healthy result.
+"""
 from __future__ import annotations
 
 import json
-import logging
-import os
-import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
+import requests
 
 from config import DATA, HOST, PORT, HORIZONS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
 from market_data import get_candles, test_provider_connectivity
-from train import MODELS, _check_provenance
-from journal import PREDICTIONS, SUMMARY
+from train import MODELS
+from journal import compute_journal_summary
 from live import get_live_status
 from universe import load_universe
 
-log = logging.getLogger(__name__)
-
-
-def age_hours(path: Path) -> float:
-    if not path.exists():
-        return 1e9
-    return (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 3600
+REAL_MODES = {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"}
 
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
-    status = "OK" if ok else "BAD"
-    print(f"  {status}  {label:<40} {detail}")
+    print(f"  {'OK ' if ok else 'BAD'}  {label:<38} {detail}")
     return ok
+
+
+def active_real_universe() -> pd.DataFrame:
+    df = load_universe()
+    if df.empty or "exchange" not in df.columns:
+        return pd.DataFrame()
+    df = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    if "universe_provenance" in df.columns:
+        df = df[df["universe_provenance"].astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])]
+    if "status" in df.columns:
+        df = df[~df["status"].astype(str).str.upper().isin(["DEMO_ONLY", "SYNTHETIC"])]
+    return df.reset_index(drop=True)
+
+
+def inspect_real_candles(universe: pd.DataFrame) -> dict:
+    result = {
+        "real_rows": 0,
+        "synthetic_rows": 0,
+        "unknown_rows": 0,
+        "real_series": 0,
+        "series_expected": int(len(universe) * 2),
+        "latest_real_timestamp": None,
+    }
+    newest = None
+    for symbol in universe["symbol"].astype(str).tolist():
+        for interval in ("1h", "1d"):
+            df = get_candles(symbol, interval, "spot")
+            if df.empty:
+                continue
+            if "source_mode" not in df.columns:
+                result["unknown_rows"] += len(df)
+                continue
+            modes = df["source_mode"].astype(str)
+            real = modes.isin([SOURCE_LIVE, SOURCE_HISTORICAL])
+            demo = modes.eq(SOURCE_SYNTHETIC)
+            result["real_rows"] += int(real.sum())
+            result["synthetic_rows"] += int(demo.sum())
+            result["unknown_rows"] += int((~real & ~demo).sum())
+            if real.any():
+                result["real_series"] += 1
+                stamps = pd.to_datetime(df.loc[real, "timestamp"], utc=True, errors="coerce").dropna()
+                if not stamps.empty:
+                    value = stamps.max()
+                    if newest is None or value > newest:
+                        newest = value
+    result["latest_real_timestamp"] = str(newest) if newest is not None else None
+    return result
 
 
 def main() -> int:
     now = datetime.now(timezone.utc)
-    bad = []
-    
-    print(f"NeuroTrom-Crypto health  {now:%Y-%m-%d %H:%M}")
-    
-    # 1. API liveness
+    failures = []
+    print(f"NeuroTrom Crypto health — {now:%Y-%m-%d %H:%M:%S} UTC")
+
     api_ok = False
     try:
-        import requests as req
-        r = req.get(f"http://{HOST}:{PORT}/health", timeout=5)
-        api_ok = r.status_code == 200
-    except Exception:
-        pass
-    bad.append(not check("API liveness", api_ok, f"{HOST}:{PORT}"))
-    
-    # 2. Provider connectivity
-    binance = test_provider_connectivity("binance")
-    kraken = test_provider_connectivity("kraken")
-    any_provider = binance.get("reachable", False) or kraken.get("reachable", False)
-    bad.append(not check("Provider connectivity (Binance)", binance.get("reachable", False), 
-                          f"latency {binance.get('latency_ms', 'N/A')}ms" if binance.get("reachable") else binance.get("error", "unreachable")))
-    bad.append(not check("Provider connectivity (Kraken)", kraken.get("reachable", False),
-                          f"latency {kraken.get('latency_ms', 'N/A')}ms" if kraken.get("reachable") else kraken.get("error", "unreachable")))
-    
-    # 3. Universe
-    df = load_universe()
-    bad.append(not check("Universe loaded", len(df) > 0, f"{len(df)} symbols"))
-    
-    # 4. Historical data coverage and provenance
-    real_data_available = False
-    synthetic_only = True
-    if not df.empty and "symbol" in df.columns:
-        sample_sym = df["symbol"].iloc[0]
-        for interval in ["1h", "1d"]:
-            real_df = get_candles(sample_sym, interval, "spot", source_mode=SOURCE_HISTORICAL)
-            live_df = get_candles(sample_sym, interval, "spot", source_mode=SOURCE_LIVE)
-            synth_df = get_candles(sample_sym, interval, "spot", source_mode=SOURCE_SYNTHETIC)
-            
-            has_real = not real_df.empty or not live_df.empty
-            if has_real:
-                real_data_available = True
-                synthetic_only = False
-            
-            last_ts = None
-            if not real_df.empty:
-                last_ts = real_df["timestamp"].max().to_pydatetime()
-            elif not live_df.empty:
-                last_ts = live_df["timestamp"].max().to_pydatetime()
-            
-            if last_ts:
-                age_h = (now - last_ts).total_seconds() / 3600
-                stale = age_h > (4 if interval == "1h" else 48)
-                last_str = last_ts.isoformat()[:19]
-            else:
-                age_h = 1e9
-                stale = True
-                last_str = "no exchange timestamp (synthetic)"
-            source_label = "REAL" if has_real else "SYNTHETIC"
-            bad.append(not check(f"{interval} data ({source_label})", not stale, 
-                                f"{len(real_df) + len(live_df) + len(synth_df)} rows, age {age_h:.1f}h, last {last_str}"))
-    
-    # 5. Model readiness
-    model_provenances = []
-    for h in HORIZONS:
-        prov_path = MODELS / f"crypto_{h}_provenance.json"
-        model_path = MODELS / f"crypto_{h}.txt"
-        if prov_path.exists():
-            prov = json.loads(prov_path.read_text())
-            model_provenances.append(prov.get("provenance", "UNKNOWN"))
-        elif model_path.exists():
-            model_provenances.append("UNKNOWN")
-    
-    models_ready = len(model_provenances) > 0
-    real_models = sum(1 for p in model_provenances if p != SOURCE_SYNTHETIC)
-    bad.append(not check("Models trained", models_ready, f"{len(model_provenances)} models, {real_models} real-data"))
-    
-    # 6. Prediction journal
-    journal_ok = SUMMARY.exists()
-    n_preds = 0
-    n_real_preds = 0
-    if PREDICTIONS.exists():
-        try:
-            preds = pd.read_parquet(PREDICTIONS)
-            n_preds = len(preds)
-            if "source_mode" in preds.columns:
-                n_real_preds = len(preds[preds["source_mode"] != SOURCE_SYNTHETIC])
-        except Exception:
-            pass
-    bad.append(not check("Prediction journal", journal_ok, f"{n_preds} total, {n_real_preds} real"))
-    
-    # 7. Live collector
-    live = get_live_status()
-    collector_running = live.get("collector_running", False)
-    bad.append(not check("Live collector", collector_running, live.get("last_update", "never")))
-    
-    # 8. Overall system status
-    if any(bad):
-        status = "DEGRADED"
-        if not any_provider and not real_data_available:
-            status = "BLOCKED — no real data provider reachable"
+        response = requests.get(f"http://{HOST}:{PORT}/health", timeout=5)
+        api_ok = response.status_code == 200 and response.json().get("service") == "neurotrom-crypto"
+    except Exception as exc:
+        api_error = f"{type(exc).__name__}: {str(exc)[:160]}"
     else:
-        status = "OK"
-    
-    print("\nOverall: {status}")
-    print(f"  Real data available: {'YES' if real_data_available else 'NO'}")
-    print(f"  Synthetic-only mode: {'YES' if synthetic_only else 'NO'}")
-    print(f"  Real predictions: {n_real_preds}")
-    
-    return 1 if any(bad) else 0
+        api_error = ""
+    failures.append(not check("API liveness", api_ok, f"{HOST}:{PORT} {api_error}".strip()))
+
+    providers = {
+        name: test_provider_connectivity(name)
+        for name in ("binance", "kraken")
+    }
+    any_provider = any(x.get("reachable", False) for x in providers.values())
+    for name, status in providers.items():
+        check(f"provider {name}", bool(status.get("reachable")),
+              f"reachable={status.get('reachable')}; transport={status.get('transport', 'requests/curl')}; error={status.get('error', '')}")
+    failures.append(not check("at least one real provider reachable", any_provider,
+                              ", ".join(f"{name}={status.get('reachable')}" for name, status in providers.items())))
+
+    universe = active_real_universe()
+    failures.append(not check("real exchange universe", len(universe) > 0,
+                              f"{len(universe)} eligible instruments"))
+    data = inspect_real_candles(universe) if not universe.empty else {
+        "real_rows": 0, "synthetic_rows": 0, "unknown_rows": 0, "real_series": 0,
+        "series_expected": 0, "latest_real_timestamp": None,
+    }
+    failures.append(not check("real exchange candles", data["real_rows"] > 0,
+                              json.dumps(data, sort_keys=True)))
+    failures.append(not check("no unknown-provenance candle rows", data["unknown_rows"] == 0,
+                              f"{data['unknown_rows']} unknown-provenance rows"))
+    check("demo candles isolated/labelled", data["synthetic_rows"] == 0,
+          f"{data['synthetic_rows']} demo rows in active universe files")
+
+    real_models = []
+    for horizon in HORIZONS:
+        model_path = MODELS / f"crypto_{horizon}.txt"
+        prov_path = MODELS / f"crypto_{horizon}_provenance.json"
+        try:
+            meta = json.loads(prov_path.read_text()) if prov_path.is_file() else {}
+        except (OSError, ValueError):
+            meta = {}
+        mode = meta.get("provenance", "UNKNOWN")
+        real_models.append(model_path.is_file() and mode in REAL_MODES)
+        check(f"model {horizon}", real_models[-1],
+              f"file={model_path.is_file()}; provenance={mode}; trained_at={meta.get('saved_at')}")
+    models_ok = all(real_models)
+    failures.append(not check("all four real-data models", models_ok,
+                              f"{sum(real_models)}/{len(HORIZONS)} real-ready"))
+
+    journal = compute_journal_summary()
+    real_predictions = int(journal.get("real_predictions", 0))
+    synthetic_predictions = int(journal.get("synthetic_predictions", 0))
+    matured_real = int(journal.get("matured", 0))
+    failures.append(not check("real forward journal", real_predictions > 0,
+                              f"real={real_predictions}; synthetic={synthetic_predictions}; matured_real={matured_real}"))
+
+    live = get_live_status()
+    age = live.get("last_update_age_seconds")
+    fresh = bool(live.get("fresh")) and bool(live.get("streams")) and age is not None and age <= 180
+    failures.append(not check("live collector fresh", fresh,
+                              f"running={live.get('collector_running')}; last={live.get('last_update')}; age_s={age}; streams={len(live.get('streams') or [])}; status={live.get('status')}"))
+
+    if not any_provider and not data["real_rows"]:
+        overall = "BLOCKED — no real data provider reachable"
+    elif not data["real_rows"]:
+        overall = "BLOCKED — provider reachable but no real candles persisted"
+    elif failures:
+        overall = "DEGRADED — real-data pipeline has unresolved health checks"
+    else:
+        overall = "OK — real-data pipeline healthy"
+
+    print(f"\nOverall: {overall}")
+    print(f"  Real candle rows: {data['real_rows']}")
+    print(f"  Synthetic demo rows in active universe files: {data['synthetic_rows']}")
+    print(f"  Real-data models: {sum(real_models)}/{len(HORIZONS)}")
+    print(f"  Real forward predictions: {real_predictions}")
+    return 1 if failures or not any_provider or not data["real_rows"] or not models_ok or real_predictions == 0 or not fresh else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
