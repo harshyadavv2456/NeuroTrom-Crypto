@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
-      - name: Install locked project dependencies without installing the app package
+      - name: Install OpenMP runtime required by LightGBM on macOS
+        run: brew install libomp
+      - name: Install project dependencies without installing the app package
         run: uv sync --no-install-project --group dev
       - name: Syntax-check Python sources
         run: uv run --no-sync python -m compileall -q src
