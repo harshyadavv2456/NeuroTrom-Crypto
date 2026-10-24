@@ -16,6 +16,9 @@ from features import build_feature_dataset
 from train import run_training
 from journal import mature_predictions, compute_journal_summary
 from live import reconcile_gaps
+from train import MODELS
+from config import SOURCE_LIVE, SOURCE_HISTORICAL
+from universe import load_universe
 
 log = logging.getLogger(__name__)
 MODELS = DATA / "models"
@@ -40,11 +43,38 @@ def run_step(name: str, fn, retries: int = 1):
             time.sleep(30)
 
 
+def _all_real_models_ready() -> bool:
+    real_modes = {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"}
+    for horizon in HORIZONS:
+        model_file = MODELS / f"crypto_{horizon}.txt"
+        provenance_file = MODELS / f"crypto_{horizon}_provenance.json"
+        if not model_file.is_file() or not provenance_file.is_file():
+            return False
+        try:
+            metadata = json.loads(provenance_file.read_text())
+        except (OSError, ValueError):
+            return False
+        if metadata.get("provenance") not in real_modes:
+            return False
+    return True
+
+
 def main():
     started = datetime.now(timezone.utc).isoformat()
     log.info("=== Daily pipeline started %s ===", started)
-    
+
     steps = []
+
+    # First-run/recovery bootstrap is only invoked while one or more real-data
+    # models are missing. It fails honestly and quickly if no provider is reachable.
+    if not _all_real_models_ready():
+        def bootstrap_real():
+            from bootstrap_real import main as bootstrap_main
+            exit_code = bootstrap_main()
+            if exit_code != 0:
+                raise RuntimeError(f"real-data bootstrap returned exit code {exit_code}")
+            return {"status": "complete"}
+        steps.append(run_step("real_bootstrap_if_needed", bootstrap_real, retries=0))
     
     # 1. Source connectivity
     steps.append(run_step("source_check", lambda: {
