@@ -194,7 +194,9 @@ def load_kaggle_source() -> tuple[dict, dict[str, pd.DataFrame]]:
     }
     if not KAGGLE_REF:
         return status, {}
-    if not (os.getenv("KAGGLE_USERNAME") and (os.getenv("KAGGLE_KEY") or os.getenv("KAGGLE_API_TOKEN"))):
+    has_token = bool(os.getenv("KAGGLE_API_TOKEN"))
+    has_legacy_credentials = bool(os.getenv("KAGGLE_USERNAME") and os.getenv("KAGGLE_KEY"))
+    if not (has_token or has_legacy_credentials):
         status.update(status="not_configured", reason="Kaggle dataset ref is set but repository Kaggle credentials are missing.")
         return status, {}
     try:
