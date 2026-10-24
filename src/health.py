@@ -116,6 +116,19 @@ def main() -> int:
                               f"{data['unknown_rows']} unknown-provenance rows"))
     failures.append(not check("production store contains only real rows", data.get("production_nonreal_rows", 0) == 0,
                               f"{data.get('production_nonreal_rows', 0)} non-real rows in production reads"))
+    migration_path = DATA / "reports" / "synthetic_migration.json"
+    try:
+        migration = json.loads(migration_path.read_text())
+        audit = migration.get("production_store_audit", {})
+        isolation_ok = (migration.get("status") == "ok"
+                        and audit.get("active_synthetic_rows") == 0
+                        and audit.get("active_unknown_rows") == 0)
+        isolation_detail = (f"status={migration.get('status')}; "
+                            f"active_synthetic={audit.get('active_synthetic_rows')}; "
+                            f"active_unknown={audit.get('active_unknown_rows')}")
+    except (OSError, ValueError, TypeError):
+        isolation_ok, isolation_detail = False, "migration report missing or unreadable"
+    failures.append(not check("physical storage isolation audit", isolation_ok, isolation_detail))
     check("synthetic fixtures isolated", True,
           f"{data['synthetic_rows']} demo rows in separate archive; excluded from production reads")
 
