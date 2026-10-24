@@ -110,6 +110,36 @@ def discover_kraken_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.
         df = df.drop_duplicates(subset=["symbol"]).sort_values(["priority", "base_asset"]).head(limit).reset_index(drop=True)
     return df
 
+def discover_coindcx_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.DataFrame:
+    """Discover active CoinDCX spot markets from its public, unauthenticated API."""
+    response = http_get("https://api.coindcx.com/exchange/v1/markets_details", timeout=12)
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("Unexpected CoinDCX market-details response")
+    rows = []
+    for item in payload:
+        if not isinstance(item, dict) or str(item.get("status", "")).lower() != "active":
+            continue
+        base = str(item.get("target_currency_short_name", "")).upper()
+        quote = str(item.get("base_currency_short_name", "")).upper()
+        symbol = str(item.get("symbol") or item.get("coindcx_name") or "").upper()
+        pair = str(item.get("pair", ""))
+        if not base or quote != quote_asset.upper() or not pair or symbol != f"{base}{quote}":
+            continue
+        rows.append({
+            "symbol": symbol, "base_asset": base, "quote_asset": quote,
+            "status": "TRADING", "contract_type": "SPOT", "exchange": "coindcx",
+            "market": "spot", "exchange_pair": pair,
+            "universe_source": "COINDCX_MARKETS_DETAILS",
+            "universe_provenance": SOURCE_HISTORICAL, "priority": 0,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        preferred_order = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "DOT", "LTC", "BCH"]
+        df["priority"] = df["base_asset"].apply(lambda x: preferred_order.index(x) if x in preferred_order else len(preferred_order) + 1)
+        df = df.drop_duplicates(subset=["symbol"]).sort_values(["priority", "base_asset"]).head(limit).reset_index(drop=True)
+    return df
+
 
 def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = True,
                    preferred_exchange: Optional[str] = None) -> pd.DataFrame:
@@ -118,8 +148,9 @@ def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = Tru
     spot = pd.DataFrame()
 
     preferred = str(preferred_exchange or "").lower()
-    order = [preferred] if preferred in {"binance", "kraken"} else []
-    order += [name for name in ("binance", "kraken") if name not in order]
+    supported = ("binance", "kraken", "coindcx")
+    order = [preferred] if preferred in supported else []
+    order += [name for name in supported if name not in order]
 
     for exchange in order:
         if not spot.empty:
@@ -144,6 +175,17 @@ def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = Tru
                         break
                 except Exception as exc:
                     log.warning("Kraken %s universe unavailable: %s", quote, exc)
+        elif exchange == "coindcx":
+            # CoinDCX is unauthenticated public market data; prefer USDT markets
+            # to preserve the existing USD-stablecoin unit when available.
+            for quote in ("USDT", "INR"):
+                try:
+                    spot = discover_coindcx_universe(quote, limit=max_symbols * 2)
+                    if not spot.empty:
+                        selected_source = f"COINDCX_MARKETS_DETAILS_{quote}"
+                        break
+                except Exception as exc:
+                    log.warning("CoinDCX %s universe unavailable: %s", quote, exc)
 
     if spot.empty:
         rows = []
