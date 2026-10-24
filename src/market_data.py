@@ -233,7 +233,8 @@ def resolve_kraken_pair(symbol: str) -> str:
 
 
 def kraken_ohlc(pair: str, interval: int = 60, since: Optional[int] = None,
-                symbol: Optional[str] = None, interval_label: Optional[str] = None) -> pd.DataFrame:
+                symbol: Optional[str] = None, interval_label: Optional[str] = None,
+                source_mode: str = SOURCE_HISTORICAL) -> pd.DataFrame:
     """Fetch completed Kraken OHLC candles for an exact exchange pair.
 
     Kraken's OHLC endpoint returns at most 720 recent rows and includes the
@@ -275,7 +276,7 @@ def kraken_ohlc(pair: str, interval: int = 60, since: Optional[int] = None,
     df["exchange"] = "kraken"
     df["trades"] = pd.to_numeric(df["count"], errors="coerce")
     df["ingested_at"] = _now_iso()
-    df["source_mode"] = SOURCE_HISTORICAL
+    df["source_mode"] = source_mode
     df["provider"] = "kraken"
     return df
 
@@ -377,18 +378,26 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
 # ---- WebSocket Live ----
 
 async def _ws_listen(streams: list[str], callback: Callable[[dict], Awaitable[None]], market_type: str = "spot", max_idle: int = 300):
-    url = f"{BINANCE_WS}/{''.join(s if s.startswith('/') else '/' + s for s in streams)}" if market_type == "spot" else f"{BINANCE_FUTURES_WS}/{''.join(s if s.startswith('/') else '/' + s for s in streams)}"
+    # Binance combined-stream syntax differs from the single-stream /ws endpoint.
+    if len(streams) == 1:
+        base = BINANCE_WS if market_type == "spot" else BINANCE_FUTURES_WS
+        url = f"{base}/{streams[0]}"
+    else:
+        base = "wss://stream.binance.com:9443/stream?streams=" if market_type == "spot" else "wss://fstream.binance.com/stream?streams="
+        url = base + "/".join(streams)
     backoff = 1
     while True:
         try:
-            log.info("Connecting WS: %s", url[:80])
+            log.info("Connecting WS streams=%d provider=binance", len(streams))
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=3) as ws:
                 backoff = 1
                 last_msg = time.time()
                 async for msg in ws:
-                    last_msg = time.time()
                     data = json.loads(msg)
-                    if "e" in data and data["e"] == "kline":
+                    # Combined streams wrap the exchange event in {stream, data}.
+                    data = data.get("data", data)
+                    last_msg = time.time()
+                    if data.get("e") == "kline":
                         k = data["k"]
                         row = {
                             "symbol": k["s"],
