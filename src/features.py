@@ -24,6 +24,27 @@ def _rsi(c: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
 
+def _load_real_candles(symbol: str, interval: str, market_type: str) -> pd.DataFrame:
+    """Merge only exchange-derived rows, with live updates taking priority over history."""
+    from market_data import get_candles
+    frames = []
+    for mode in (SOURCE_HISTORICAL, SOURCE_LIVE):
+        part = get_candles(symbol, interval, market_type, source_mode=mode)
+        if not part.empty:
+            frames.append(part)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    if "source_mode" not in df.columns or "provider" not in df.columns:
+        return pd.DataFrame()
+    df["_source_priority"] = df["source_mode"].map({SOURCE_HISTORICAL: 1, SOURCE_LIVE: 2}).fillna(0)
+    df["_ingested_sort"] = pd.to_datetime(df.get("ingested_at"), utc=True, errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"]).sort_values(["timestamp", "_source_priority", "_ingested_sort"])
+    df = df.drop_duplicates(subset=["timestamp"], keep="last")
+    return df.drop(columns=["_source_priority", "_ingested_sort"], errors="ignore").reset_index(drop=True)
+
+
 def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot", require_real: bool = False) -> Optional[pd.DataFrame]:
     """Compute all features for a symbol from stored OHLCV data.
     
@@ -31,19 +52,12 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
         require_real: If True, reject datasets that contain only synthetic data.
     """
     from market_data import get_candles
-    
-    # Select exactly one explicit provenance class. Never let the first row label a
-    # mixed real/synthetic file and never allow unprovenanced legacy rows as real.
-    df = get_candles(symbol, interval, market_type, source_mode=SOURCE_HISTORICAL)
-    source_mode = SOURCE_HISTORICAL
 
-    if df.empty:
-        df = get_candles(symbol, interval, market_type, source_mode=SOURCE_LIVE)
-        source_mode = SOURCE_LIVE
-
+    # Combine historical and live EXCHANGE data only; live rows replace historical
+    # rows for identical timestamps. Synthetic fixtures are a separate opt-in path.
+    df = _load_real_candles(symbol, interval, market_type)
     if df.empty and not require_real:
         df = get_candles(symbol, interval, market_type, source_mode=SOURCE_SYNTHETIC)
-        source_mode = SOURCE_SYNTHETIC
 
     if df.empty:
         return None
@@ -53,14 +67,9 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
         if "source_mode" not in df.columns or not set(df["source_mode"].dropna().astype(str)).issubset(allowed_real):
             log.warning("Rejecting non-real or unprovenanced data for production features: %s %s", symbol, interval)
             return None
-        if df["source_mode"].nunique() != 1:
-            log.warning("Rejecting mixed-source series for production features: %s %s", symbol, interval)
-            return None
     elif "source_mode" not in df.columns or df["source_mode"].nunique() != 1:
         log.warning("Rejecting ambiguous provenance in demo feature series: %s %s", symbol, interval)
         return None
-    else:
-        source_mode = str(df["source_mode"].iloc[0])
     
     if df.empty or len(df) < 60:
         return None
@@ -77,8 +86,8 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     f["symbol"] = symbol
     f["interval"] = interval
     f["market"] = market_type
-    f["source_mode"] = source_mode
-    f["provider"] = df["provider"].iloc[0] if "provider" in df.columns else "unknown"
+    f["source_mode"] = df["source_mode"].astype(str).to_numpy()
+    f["provider"] = df["provider"].astype(str).to_numpy() if "provider" in df.columns else "unknown"
     f["close"] = c
     
     # Returns
@@ -141,7 +150,9 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     
     # BTC regime feature
     try:
-        btc = get_candles("BTCUSDT", interval, market_type, source_mode=source_mode)
+        btc = _load_real_candles("BTCUSDT", interval, market_type)
+        if btc.empty and not require_real:
+            btc = get_candles("BTCUSDT", interval, market_type, source_mode=SOURCE_SYNTHETIC)
         if not btc.empty:
             btc = btc.sort_values("timestamp").reset_index(drop=True)
             btc_lc = np.log(btc["close"].astype("float64"))
