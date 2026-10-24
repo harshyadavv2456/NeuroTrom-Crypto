@@ -383,12 +383,11 @@ def system_health():
     backfill = load_backfill_state()
     df = load_universe()
     providers = _provider_status()
-    binance, kraken = providers["binance"], providers["kraken"]
     return _clean({
         "api_live": True,
         "live_collector_running": live.get("collector_running", False),
         "live_last_update": live.get("last_update"),
-        "providers": {"binance": binance, "kraken": kraken},
+        "providers": providers,
         "backfill_last_run": backfill.get("last_run"),
         "backfill_errors": len(backfill.get("errors", [])),
         "universe_count": len(df),
