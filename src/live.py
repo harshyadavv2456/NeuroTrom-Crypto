@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import requests
 
 from config import DATA, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC, UNIVERSE_SIZE
 from market_data import (
@@ -263,6 +264,7 @@ class LiveCollector:
             return 0, errors, providers
 
         ok_symbols: list[str] = []
+        successful_meta: list[dict] = []
         errors: list[str] = []
         latest = None
         failures_in_a_row = 0
@@ -272,15 +274,37 @@ class LiveCollector:
                 break
             symbol = str(meta["symbol"])
             provider = str(meta["exchange"]).lower()
-            # Attempt the real ticker request even if the fast probe failed; the
-            # data request has its own timeout and Binance host failover.
+            # Probe failures can be transient. Try the assigned exchange first; on
+            # transport failure only, retry the same symbol on the other real provider.
+            # HTTP 4xx/429 and pair-resolution errors are not silently routed around.
+            wait_provider = provider
             try:
-                ticker = fetch_ticker(symbol, "spot", provider)
-                _save_ticker_snapshot(ticker, meta.to_dict())
+                try:
+                    ticker = fetch_ticker(symbol, "spot", provider)
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                        requests.exceptions.SSLError) as primary_exc:
+                    alternate = "kraken" if provider == "binance" else "binance"
+                    providers.setdefault(provider, {})
+                    providers[provider].update({
+                        "provider": provider,
+                        "reachable": False,
+                        "last_error": f"{type(primary_exc).__name__}: {str(primary_exc)[:180]}",
+                        "observed_by": "ticker_transport_failure",
+                    })
+                    log.warning("%s transport failed for %s; trying %s: %s",
+                                provider, symbol, alternate, primary_exc)
+                    ticker = fetch_ticker(symbol, "spot", alternate)
+                    errors.append(f"{provider}/{symbol} transport failed; using {alternate} fallback")
+                actual_provider = str(ticker.get("provider", provider)).lower()
+                wait_provider = actual_provider
+                meta_for_save = meta.to_dict()
+                meta_for_save["exchange"] = actual_provider
+                _save_ticker_snapshot(ticker, meta_for_save)
+                successful_meta.append(meta_for_save)
                 received = _now_iso()
-                providers.setdefault(provider, {})
-                providers[provider].update({
-                    "provider": provider,
+                providers.setdefault(actual_provider, {})
+                providers[actual_provider].update({
+                    "provider": actual_provider,
                     "reachable": True,
                     "last_success": received,
                     "last_success_transport": ticker.get("transport", "requests"),
@@ -298,7 +322,7 @@ class LiveCollector:
                     provider_status=providers,
                     errors=errors[-20:],
                     last_symbol=symbol,
-                    last_provider=provider,
+                    last_provider=actual_provider,
                     source_mode=SOURCE_LIVE,
                 )
             except Exception as exc:
@@ -309,12 +333,12 @@ class LiveCollector:
                 if failures_in_a_row >= 5:
                     log.error("Five consecutive ticker failures; ending this cycle to respect provider limits")
                     break
-            self.stop_event.wait(PROVIDER_REQUEST_INTERVAL_SECONDS.get(provider, MIN_REQUEST_INTERVAL_SECONDS))
+            self.stop_event.wait(PROVIDER_REQUEST_INTERVAL_SECONDS.get(wait_provider, MIN_REQUEST_INTERVAL_SECONDS))
 
-        # Ticker snapshots are real, but are not candles. Refresh completed exchange
-        # candles separately and keep their HISTORICAL_EXCHANGE provenance.
-        if ok_symbols and not self.stop_event.is_set():
-            self._refresh_recent_candles(universe)
+        # Ticker snapshots are real but are not candles. Refresh only symbols that
+        # actually returned live observations, using the exchange that served them.
+        if successful_meta and not self.stop_event.is_set():
+            self._refresh_recent_candles(pd.DataFrame(successful_meta))
 
         previous = load_live_state().get("last_update")
         self._update_status(
