@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import DATA, HORIZONS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
+from config import DATA, HORIZONS, HORIZON_BARS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
 
 log = logging.getLogger(__name__)
 JOURNAL = DATA / "journal"
@@ -75,13 +75,23 @@ def mature_predictions(horizon: str = "24h"):
     
     for _, row in unmatured.iterrows():
         sym = row["symbol"]
-        pred_ts = pd.Timestamp(row["timestamp"], tz="UTC")
+        pred_ts = pd.Timestamp(row["timestamp"])
+        pred_ts = pred_ts.tz_localize("UTC") if pred_ts.tzinfo is None else pred_ts.tz_convert("UTC")
         entry_price = row["price_at_prediction"]
-        
-        bars = {"1h": 1, "4h": 4, "24h": 20, "7d": 140}.get(horizon, 20)
-        
+        bars = int(HORIZON_BARS.get(horizon, 24))
+
         df = get_candles(sym, "1h", "spot", start=pred_ts, end=pred_ts + pd.Timedelta(hours=bars * 2))
-        if df.empty or len(df) <= bars:
+        if df.empty or "source_mode" not in df.columns:
+            continue
+        # Only exchange-derived bars may score a real prediction; synthetic and
+        # unprovenanced records must never silently complete a live forecast.
+        df = df[df["source_mode"].isin([SOURCE_LIVE, SOURCE_HISTORICAL])].copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        if df.empty:
+            continue
+        # Anchor the evaluation on the input candle timestamp saved with the prediction.
+        df = df[df["timestamp"] >= pred_ts].reset_index(drop=True)
+        if len(df) <= bars:
             continue
         
         exit_price = df.iloc[bars]["close"]
@@ -124,8 +134,12 @@ def compute_journal_summary() -> dict:
     
     preds = pd.read_parquet(PREDICTIONS)
     total = len(preds)
-    real = len(preds[preds.get("source_mode", SOURCE_SYNTHETIC) != SOURCE_SYNTHETIC])
-    synthetic = total - real
+    modes = preds["source_mode"].astype(str) if "source_mode" in preds.columns else pd.Series(["UNKNOWN"] * len(preds), index=preds.index)
+    real_mask = modes.isin([SOURCE_LIVE, SOURCE_HISTORICAL])
+    synthetic_mask = modes.eq(SOURCE_SYNTHETIC)
+    real = int(real_mask.sum())
+    synthetic = int(synthetic_mask.sum())
+    unknown = int(total - real - synthetic)
     
     matured = preds[preds["matured"] == True].copy()
     
@@ -133,6 +147,7 @@ def compute_journal_summary() -> dict:
         "total_predictions": total,
         "real_predictions": real,
         "synthetic_predictions": synthetic,
+        "unknown_provenance_predictions": unknown,
         "matured": len(matured),
         "by_horizon": {},
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -144,21 +159,22 @@ def compute_journal_summary() -> dict:
             summary["by_horizon"][h] = {"n": 0}
             continue
         
-        actuals = h_preds["actual_return"].dropna()
-        predicted = h_preds["predicted_return"]
-        
-        if len(actuals) > 10:
-            ic, _ = spearmanr(predicted.iloc[:len(actuals)], actuals)
-            direction_acc = ((predicted.iloc[:len(actuals)] > 0) == (actuals > 0)).mean()
+        valid = h_preds.dropna(subset=["actual_return", "predicted_return"]).copy()
+        actuals = valid["actual_return"]
+        predicted = valid["predicted_return"]
+
+        if len(valid) > 10:
+            ic, _ = spearmanr(predicted, actuals)
+            direction_acc = ((predicted > 0) == (actuals > 0)).mean()
             summary["by_horizon"][h] = {
-                "n": int(len(actuals)),
-                "rank_ic": round(float(ic), 4),
+                "n": int(len(valid)),
+                "rank_ic": round(float(ic), 4) if np.isfinite(ic) else None,
                 "direction_accuracy": round(float(direction_acc), 4),
-                "mean_predicted": round(float(predicted.iloc[:len(actuals)].mean()), 4),
+                "mean_predicted": round(float(predicted.mean()), 4),
                 "mean_actual": round(float(actuals.mean()), 4),
             }
         else:
-            summary["by_horizon"][h] = {"n": int(len(actuals)), "note": "insufficient matured predictions"}
+            summary["by_horizon"][h] = {"n": int(len(valid)), "note": "insufficient matured predictions"}
     
     SUMMARY.write_text(json.dumps(summary, indent=2))
     return summary
