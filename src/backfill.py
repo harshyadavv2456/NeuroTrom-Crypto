@@ -236,6 +236,6 @@ def reconcile_gaps():
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    r, e = backfill_universe(days=7)
+    r, e = backfill_universe(days=365)
     print(f"Backfill: {r} rows, {len(e)} errors")
 
