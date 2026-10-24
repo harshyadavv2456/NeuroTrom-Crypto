@@ -88,6 +88,22 @@ APPROVED_SOURCES = [
         approved_for_use=True,
     ),
     DataSource(
+        id="coindcx_spot_rest",
+        name="CoinDCX Public Spot REST API",
+        provider="CoinDCX",
+        data_type="market_data_and_ohlcv",
+        endpoint_url="https://api.coindcx.com/exchange/ticker",
+        docs_url="https://docs.coindcx.com/",
+        auth_required=False,
+        rate_limit="CoinDCX API documentation states 16 requests/second; this client is throttled below that rate",
+        historical_coverage="Public ticker; candles endpoint supports documented 1m, 15m, 1h and 1d intervals",
+        usage_terms="Public market-data endpoints do not require credentials. CoinDCX API license terms restrict redistribution or third-party display of market data and derived research; use locally for personal research only unless CoinDCX confirms additional rights.",
+        commercial_status="commercial_rights_unconfirmed",
+        conditions="No API key or secret is used. Do not enable authenticated or trading endpoints. Do not display, redistribute, or commercialize this data or derived analytics without written CoinDCX authorization.",
+        terms_reviewed_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        approved_for_use=True,
+    ),
+    DataSource(
         id="coingecko_free",
         name="CoinGecko Free API",
         provider="CoinGecko",
@@ -110,7 +126,10 @@ def load_sources() -> list:
     if DATA_SOURCES_PATH.exists():
         try:
             data = json.loads(DATA_SOURCES_PATH.read_text())
-            return [DataSource(**s) for s in data]
+            saved = [DataSource(**s) for s in data]
+            saved_ids = {s.id for s in saved}
+            # New providers should appear without overwriting local approval choices.
+            return saved + [s for s in APPROVED_SOURCES if s.id not in saved_ids]
         except Exception:
             pass
     return list(APPROVED_SOURCES)
