@@ -217,11 +217,14 @@ def build_feature_dataset(symbols: list[str] = None, interval: str = "1h", marke
     
     combined = pd.concat(all_feats, ignore_index=True)
     
-    # Add market-relative ranks
-    combined["date"] = pd.to_datetime(combined["timestamp"]).dt.floor("D")
+    # Cross-sectional ranks must be computed using instruments observed at the
+    # exact same market timestamp. Ranking across an entire day leaks future hours
+    # into early-hour features for a 24/7 market.
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True, errors="coerce")
+    combined["date"] = combined["timestamp"].dt.floor("D")
     for col in ["ret_1", "ret_20", "vol_20", "vol_ratio", "rsi_14"]:
         if col in combined.columns:
-            combined[f"{col}_rank"] = combined.groupby(["date", "interval", "market"])[col].rank(pct=True)
+            combined[f"{col}_rank"] = combined.groupby(["timestamp", "interval", "market"])[col].rank(pct=True)
     
     return combined
 
