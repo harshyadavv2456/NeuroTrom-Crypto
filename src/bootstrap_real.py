@@ -73,7 +73,7 @@ def main() -> int:
     # Refresh the universe from official exchange metadata. If discovery fails,
     # retain an existing real universe but never promote the synthetic fixture list.
     try:
-        build_universe(UNIVERSE_SIZE)
+        build_universe(UNIVERSE_SIZE, preferred_exchange=("binance" if providers.get("binance", {}).get("reachable") else "kraken"))
     except Exception as exc:
         log.warning("Universe refresh failed: %s", exc)
     universe = _real_universe()
