@@ -1,29 +1,29 @@
 # Data Sources and Rights
 
-## Approved sources
+## Data source policy
 
-| Provider | Data Type | Auth | Rate Limit | Status | Conditions |
-|---|---|---|---|---|---|
-| Binance Spot REST | OHLCV | None | 2400 weight/min | `approved_for_personal_research` | Personal/research only; unreachable from current Python environment |
-| Binance Spot WS | OHLCV live | None | 1024 streams/conn | `approved_for_personal_research` | Personal/research only; unreachable from current Python environment |
-| Kraken Spot REST | OHLCV | None | Public endpoints | `approved_for_personal_research` | Personal/research only; endpoint reachable via curl but Python requests receives ConnectionResetError on this network |
-| CCXT | OHLCV wrapper | Varies | Varies by exchange | `commercial_rights_unconfirmed` | Check each exchange's terms |
-| CoinGecko Free | Metadata | None | ~10-30 req/min | `commercial_use_requires_license` | Paid plan needed for commercial use |
+| Source | Role in cloud pipeline | Authentication | Public output policy |
+|---|---|---|---|
+| Binance Spot public REST | Hourly candles and 24-hour ticker for research models and forecasts | None | Non-commercial research only; do not assume commercial, redistribution, or signal-distribution rights |
+| Kaggle dataset | Optional older hourly history for exact supported symbols | Kaggle token via GitHub Actions secret | Only explicit permissive licenses are accepted; source license/attribution must be checked |
+| CoinDCX public REST | Not used by the public cloud pipeline | No credential required for public endpoints | Excluded because current CoinDCX API terms prohibit third-party display or redistribution of market data and derived research |
 
-## Current network status (verified 2026-10-25)
+## Freshness rules
 
-- `api.binance.com`: unreachable from Python `requests` (connection timeout to port 443). Curl also times out.
-- `api.kraken.com`: endpoint responds to curl (`/0/public/Time` and `/0/public/OHLC` return valid JSON). Python `requests` receives `ConnectionResetError(54)` on TLS handshake. Cause is network/firewall interception, not endpoint downtime.
-- No commercial-use rights have been verified for any bulk historical dataset.
+- Current ticker and hourly candle timestamps come from exchange responses, not the Kaggle dataset's last-updated date.
+- Kaggle metadata freshness is reported independently. By default, datasets older than 7 days are marked stale, but compatible older history may only be used to extend dates before the 365-day API window.
+- The pipeline accepts Kaggle input only if the declared license contains CC0, Public Domain, or CC BY 4.0 in a recognized form.
+- Only exact symbol/quote matches with hourly OHLCV columns are accepted. Daily rows are not upsampled into fake hourly data. USD and USDT instruments are never silently relabelled.
+- If live API access fails, the dashboard reports degraded status. Historical Kaggle data is not described as live data.
 
-## Mandatory restrictions
+## Provider references
 
-- Binance Vision bulk datasets are CC BY-NC-SA 4.0 (non-commercial). We do NOT use Binance Vision.
-- Public API availability does not automatically grant commercial data rights.
-- No exchange provides unlimited, unrestricted API access.
-- Rate limits are respected; no evasion or rotation.
-- When a provider is unreachable, the system reports `BLOCKED — no real data provider reachable` and does not silently substitute another exchange's prices as if they were identical.
+- Binance API endpoint documentation: https://github.com/binance/binance-spot-api-docs
+- Binance public market-data-only endpoints: https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md
+- Kaggle API documentation: https://www.kaggle.com/docs/api
+- Kaggle dataset documentation: https://www.kaggle.com/docs/datasets
+- CoinDCX API terms: https://docs.coindcx.com/ (sections 2.3(c) and 4)
 
-## Review date
+## Important
 
-All terms reviewed: 2026-10-25. Re-review before any commercial deployment.
+This repository is for non-commercial research. A free public API endpoint does not automatically grant rights for paid products, trading signals, redistribution, or commercialization. The project does not execute trades, access balances, or store exchange account credentials.
