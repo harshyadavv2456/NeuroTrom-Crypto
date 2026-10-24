@@ -306,6 +306,13 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
         return total_rows
     
     cur = max(current_start, start)
+    if provider == "kraken":
+        # Kraken OHLC returns at most 720 bars and cannot page into older history.
+        interval_minutes = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
+                            "1h": 60, "4h": 240, "1d": 1440, "7d": 10080}
+        if interval not in interval_minutes:
+            raise ValueError(f"Unsupported Kraken interval: {interval}")
+        cur = max(start, end - pd.Timedelta(minutes=interval_minutes[interval] * 720))
     batch = 1000
     consecutive_errors = 0
     
@@ -324,8 +331,7 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
                     raise ValueError(f"Unsupported Kraken candle interval: {interval}")
                 kraken_interval = interval_minutes[interval]
                 effective_start = max(cur, end - pd.Timedelta(minutes=kraken_interval * 720))
-                pair_name = resolve_kraken_pair(symbol)
-                df = kraken_ohlc(pair_name, interval=kraken_interval,
+                df = kraken_ohlc(symbol, interval=kraken_interval,
                                   since=int(effective_start.timestamp()),
                                   symbol=symbol, interval_label=interval)
                 if not df.empty:
@@ -354,6 +360,10 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
             }))
             
             time.sleep(0.05)
+            if provider == "kraken":
+                # Kraken only returns the newest 720 bars: a second page call would
+                # repeat the same window and can loop forever.
+                break
             
         except requests.exceptions.HTTPError as e:
             consecutive_errors += 1
