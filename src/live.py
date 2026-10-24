@@ -293,7 +293,15 @@ class LiveCollector:
             try:
                 ticker = None
                 provider_errors = []
-                provider_order = [provider] + [p for p in ("binance", "kraken", "coindcx") if p != provider]
+                all_providers = ("binance", "kraken", "coindcx")
+                # Prefer providers whose current probe succeeded to avoid burning
+                # most of the minute on repeated timeouts to a known-dead host.
+                reachable_order = [p for p in all_providers if providers.get(p, {}).get("reachable")]
+                provider_order = []
+                if provider in reachable_order:
+                    provider_order.append(provider)
+                provider_order.extend(p for p in reachable_order if p not in provider_order)
+                provider_order.extend(p for p in all_providers if p not in provider_order)
                 for candidate_provider in provider_order:
                     try:
                         ticker = fetch_ticker(symbol, "spot", candidate_provider)
