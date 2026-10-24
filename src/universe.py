@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-from config import DATA, PRIMARY_EXCHANGE, PRIMARY_MARKET, UNIVERSE_SIZE
+from config import DATA, PRIMARY_EXCHANGE, PRIMARY_MARKET, UNIVERSE_SIZE, SOURCE_SYNTHETIC, SOURCE_HISTORICAL
+from http_client import http_get
 
 log = logging.getLogger(__name__)
 UNIVERSE_PATH = DATA / "state" / "universe.json"
@@ -41,7 +42,7 @@ def discover_binance_universe(market_type: str = "spot", quote_asset: str = "USD
     url = f"{base_url}/api/v3/exchangeInfo" if market_type == "spot" else f"{base_url}/fapi/v1/exchangeInfo"
     
     log.info("Fetching Binance %s exchange info...", market_type)
-    r = requests.get(url, timeout=30)
+    r = http_get(url, timeout=30)
     r.raise_for_status()
     info = r.json()
     
@@ -74,54 +75,102 @@ def discover_binance_universe(market_type: str = "spot", quote_asset: str = "USD
     return df
 
 
+def discover_kraken_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.DataFrame:
+    """Discover active exact-quote Kraken spot pairs; never relabel USD data as USDT."""
+    response = http_get("https://api.kraken.com/0/public/AssetPairs", timeout=20)
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(f"Kraken AssetPairs error: {payload['error']}")
+    rows = []
+    for pair_key, item in payload.get("result", {}).items():
+        wsname = str(item.get("wsname", ""))
+        if "/" not in wsname or item.get("status", "online") != "online":
+            continue
+        base, quote = (part.upper() for part in wsname.split("/", 1))
+        base = "BTC" if base == "XBT" else base
+        if quote != quote_asset.upper():
+            continue
+        rows.append({
+            "symbol": f"{base}{quote}",
+            "base_asset": base,
+            "quote_asset": quote,
+            "status": "TRADING",
+            "contract_type": "SPOT",
+            "exchange": "kraken",
+            "market": "spot",
+            "exchange_pair": item.get("altname", pair_key),
+            "universe_source": "KRAKEN_ASSET_PAIRS",
+            "universe_provenance": SOURCE_HISTORICAL,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["symbol"]).sort_values("symbol").head(limit).reset_index(drop=True)
+    return df
+
+
 def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = True) -> pd.DataFrame:
-    """Build the full tradable universe. Falls back to synthetic if network is unavailable."""
+    """Build a real exchange-derived universe when possible; mark offline fixtures explicitly."""
+    selected_source = "SYNTHETIC_DEMO"
+    spot = pd.DataFrame()
+
     try:
         spot = discover_binance_universe("spot", "USDT", limit=max_symbols * 2)
-    except Exception as e:
-        log.warning("Cannot reach Binance (%s). Using synthetic universe.", e)
-        spot = pd.DataFrame()
-    
+        if not spot.empty:
+            selected_source = "BINANCE_EXCHANGE_INFO"
+            spot["universe_source"] = selected_source
+            spot["universe_provenance"] = SOURCE_HISTORICAL
+    except Exception as exc:
+        log.warning("Binance universe unavailable: %s", exc)
+
     if spot.empty:
-        # Synthetic fallback
-        symbols = SYNTHETIC_UNIVERSE[:max_symbols]
+        try:
+            spot = discover_kraken_universe("USDT", limit=max_symbols * 2)
+            if not spot.empty:
+                selected_source = "KRAKEN_ASSET_PAIRS"
+        except Exception as exc:
+            log.warning("Kraken universe unavailable: %s", exc)
+
+    if spot.empty:
         rows = []
-        for sym in symbols:
-            base = sym.replace("USDT", "")
+        for sym in SYNTHETIC_UNIVERSE[:max_symbols]:
+            base = sym[:-4] if sym.endswith("USDT") else sym
             rows.append({
-                "symbol": sym,
-                "base_asset": base,
-                "quote_asset": "USDT",
-                "status": "TRADING",
-                "contract_type": "SPOT",
-                "exchange": "binance",
-                "market": "spot",
+                "symbol": sym, "base_asset": base, "quote_asset": "USDT",
+                "status": "DEMO_ONLY", "contract_type": "SPOT",
+                "exchange": "synthetic", "market": "spot",
+                "universe_source": "SYNTHETIC_DEMO",
+                "universe_provenance": SOURCE_SYNTHETIC,
             })
         spot = pd.DataFrame(rows)
-        log.info("Using synthetic fallback universe: %d symbols", len(spot))
-    
-    spot["priority"] = 0
+        selected_source = "SYNTHETIC_DEMO"
+        log.warning("No exchange metadata reachable; using %d demo-only symbols", len(spot))
+
+    if "priority" not in spot.columns:
+        spot["priority"] = 0
     spot = spot.sort_values(["priority", "base_asset"]).reset_index(drop=True)
     selected = spot.head(max_symbols).copy()
     selected["listed_at"] = datetime.now(timezone.utc).isoformat()
-    selected["in_model"] = True
-    
+    selected["in_model"] = selected["universe_provenance"].isin([SOURCE_HISTORICAL]) if "universe_provenance" in selected else selected["exchange"].ne("synthetic")
+
     snap = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "binance_spot_rest" if not spot.empty and spot.iloc[0]["exchange"] == "binance" else "synthetic_fallback",
+        "source": selected_source,
+        "provenance": SOURCE_SYNTHETIC if selected_source == "SYNTHETIC_DEMO" else SOURCE_HISTORICAL,
         "count": len(selected),
         "symbols": selected["symbol"].tolist(),
     }
     snap_path = SNAPSHOT_DIR / f"universe_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.json"
     snap_path.write_text(json.dumps(snap, indent=2))
-    
+
     UNIVERSE_PATH.write_text(json.dumps({
         "generated_at": snap["generated_at"],
+        "source": selected_source,
+        "provenance": snap["provenance"],
         "symbols": selected.to_dict(orient="records"),
         "count": len(selected),
     }, indent=2))
-    
-    log.info("Universe saved: %d symbols", len(selected))
+
+    log.info("Universe saved: %d symbols from %s", len(selected), selected_source)
     return selected
 
 
