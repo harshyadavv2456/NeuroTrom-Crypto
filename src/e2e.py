@@ -49,7 +49,7 @@ def _real_universe() -> pd.DataFrame:
     df = load_universe()
     if df.empty or "exchange" not in df.columns:
         return pd.DataFrame()
-    real = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    real = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken", "coindcx"])].copy()
     if "universe_provenance" in real.columns:
         real = real[real["universe_provenance"].astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])]
     if "status" in real.columns:
@@ -102,6 +102,7 @@ def main() -> int:
                 f"reachable={result.get('reachable')}; transport={result.get('transport', 'requests/curl')}; error={result.get('error', '')}")
     check("sources", "binance_connectivity_reported", lambda: provider_check("binance"))
     check("sources", "kraken_connectivity_reported", lambda: provider_check("kraken"))
+    check("sources", "coindcx_connectivity_reported", lambda: provider_check("coindcx"))
 
     universe = _real_universe()
     check("universe", "real_exchange_universe_loaded", (len(universe) > 0, f"{len(universe)} real instruments"))
