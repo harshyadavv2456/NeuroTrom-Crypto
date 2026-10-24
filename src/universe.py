@@ -90,6 +90,8 @@ def discover_kraken_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.
         base = "BTC" if base == "XBT" else base
         if quote != quote_asset.upper():
             continue
+        preferred_order = ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "DOT", "LTC", "BCH"]
+        priority = preferred_order.index(base) if base in preferred_order else len(preferred_order) + 1
         rows.append({
             "symbol": f"{base}{quote}",
             "base_asset": base,
@@ -101,10 +103,11 @@ def discover_kraken_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.
             "exchange_pair": item.get("altname", pair_key),
             "universe_source": "KRAKEN_ASSET_PAIRS",
             "universe_provenance": SOURCE_HISTORICAL,
+            "priority": priority,
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.drop_duplicates(subset=["symbol"]).sort_values("symbol").head(limit).reset_index(drop=True)
+        df = df.drop_duplicates(subset=["symbol"]).sort_values(["priority", "base_asset"]).head(limit).reset_index(drop=True)
     return df
 
 
@@ -123,12 +126,16 @@ def build_universe(max_symbols: int = UNIVERSE_SIZE, include_futures: bool = Tru
         log.warning("Binance universe unavailable: %s", exc)
 
     if spot.empty:
-        try:
-            spot = discover_kraken_universe("USDT", limit=max_symbols * 2)
-            if not spot.empty:
-                selected_source = "KRAKEN_ASSET_PAIRS"
-        except Exception as exc:
-            log.warning("Kraken universe unavailable: %s", exc)
+        # Use exact-quote USDT if available; otherwise use real USD pairs. Never rename
+        # a BTC/USD market as BTC/USDT just to preserve a synthetic symbol convention.
+        for quote in ("USDT", "USD"):
+            try:
+                spot = discover_kraken_universe(quote, limit=max_symbols * 2)
+                if not spot.empty:
+                    selected_source = f"KRAKEN_ASSET_PAIRS_{quote}"
+                    break
+            except Exception as exc:
+                log.warning("Kraken %s universe unavailable: %s", quote, exc)
 
     if spot.empty:
         rows = []
