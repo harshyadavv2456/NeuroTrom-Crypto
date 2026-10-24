@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import DATA, HORIZONS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
+from config import DATA, HORIZONS, HORIZON_BARS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
 
 log = logging.getLogger(__name__)
 FEATURES_DIR = DATA / "features"
@@ -32,23 +32,35 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     """
     from market_data import get_candles
     
-    # Try to get real data first
+    # Select exactly one explicit provenance class. Never let the first row label a
+    # mixed real/synthetic file and never allow unprovenanced legacy rows as real.
     df = get_candles(symbol, interval, market_type, source_mode=SOURCE_HISTORICAL)
     source_mode = SOURCE_HISTORICAL
-    
+
     if df.empty:
-        # Fall back to live data
         df = get_candles(symbol, interval, market_type, source_mode=SOURCE_LIVE)
         source_mode = SOURCE_LIVE
-    
+
+    if df.empty and not require_real:
+        df = get_candles(symbol, interval, market_type, source_mode=SOURCE_SYNTHETIC)
+        source_mode = SOURCE_SYNTHETIC
+
     if df.empty:
-        # Last resort: check if any data exists (including synthetic)
-        df = get_candles(symbol, interval, market_type)
-        source_mode = df["source_mode"].iloc[0] if "source_mode" in df.columns and not df.empty else SOURCE_SYNTHETIC
-    
-    if require_real and source_mode == SOURCE_SYNTHETIC:
-        log.warning("Rejecting synthetic data for production training: %s %s", symbol, interval)
         return None
+
+    allowed_real = {SOURCE_HISTORICAL, SOURCE_LIVE}
+    if require_real:
+        if "source_mode" not in df.columns or not set(df["source_mode"].dropna().astype(str)).issubset(allowed_real):
+            log.warning("Rejecting non-real or unprovenanced data for production features: %s %s", symbol, interval)
+            return None
+        if df["source_mode"].nunique() != 1:
+            log.warning("Rejecting mixed-source series for production features: %s %s", symbol, interval)
+            return None
+    elif "source_mode" not in df.columns or df["source_mode"].nunique() != 1:
+        log.warning("Rejecting ambiguous provenance in demo feature series: %s %s", symbol, interval)
+        return None
+    else:
+        source_mode = str(df["source_mode"].iloc[0])
     
     if df.empty or len(df) < 60:
         return None
@@ -123,8 +135,7 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     f["max_drawdown_20"] = c.rolling(20).apply(lambda x: (x / x.cummax() - 1).min(), raw=False)
     
     # Labels (future returns) - compute only for completed bars
-    label_horizons = {"1h": 1, "4h": 4, "24h": 20, "7d": 140}
-    for h_name, h_bars in label_horizons.items():
+    for h_name, h_bars in HORIZON_BARS.items():
         if h_bars < len(f):
             f[f"label_{h_name}"] = lc.shift(-h_bars) - lc
     
