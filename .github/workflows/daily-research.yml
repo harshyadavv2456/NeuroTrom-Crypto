@@ -1,0 +1,102 @@
+name: Daily Crypto Refresh and GitHub Pages
+
+on:
+  schedule:
+    # 06:17 Asia/Kolkata. Scheduled times are approximate on GitHub-hosted runners.
+    - cron: "47 0 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/cloud_pipeline.py"
+      - "site/**"
+      - ".github/workflows/daily-research.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: neurotrom-pages
+  cancel-in-progress: false
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: \${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install runtime and test dependencies
+        run: uv sync --no-install-project --group dev
+
+      - name: Install Kaggle CLI only when an input dataset is configured
+        env:
+          KAGGLE_INPUT_DATASET: \${{ vars.KAGGLE_INPUT_DATASET }}
+          KAGGLE_USERNAME: \${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: \${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: \${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          if [[ -n "$KAGGLE_INPUT_DATASET" && ( -n "$KAGGLE_API_TOKEN" || ( -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ) ) ]]; then
+            uv pip install --python .venv/bin/python kaggle
+            echo "Kaggle input configured; source freshness and license will be checked by the pipeline."
+          elif [[ -n "$KAGGLE_INPUT_DATASET" ]]; then
+            echo "::warning::KAGGLE_INPUT_DATASET is set but Kaggle credentials are missing. The pipeline will continue with live public data."
+          else
+            echo "No Kaggle input dataset configured; the live public API remains the primary source."
+          fi
+
+      - name: Run cloud ingest, model training, evaluation and forecast
+        id: pipeline
+        env:
+          KAGGLE_INPUT_DATASET: \${{ vars.KAGGLE_INPUT_DATASET }}
+          KAGGLE_USERNAME: \${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: \${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: \${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_STALE_AFTER_DAYS: "7"
+          NEUROTROM_HISTORY_DAYS: "365"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set +e
+          uv run --no-sync python scripts/cloud_pipeline.py
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [[ ! -s site/data/latest.json ]]; then
+            echo "::error::The pipeline failed without producing a dashboard status file."
+            exit "$code"
+          fi
+          # Always publish the current status report, even when data/model quality is degraded.
+          exit 0
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload static dashboard artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy dashboard
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Fail the run when market data or all models are not ready
+        if: steps.pipeline.outputs.exit_code != '0'
+        run: |
+          echo "::error::Dashboard was published, but the latest pipeline run is degraded. See the on-page status and the job logs."
+          exit 1
