@@ -12,33 +12,36 @@ Independent local crypto-market intelligence engine. Learns from NeuroTrom FinVe
 
 ```bash
 cd ~/neurotrom-crypto
-uv venv
-uv pip install -e ".[dev]"
+uv sync --no-install-project --group dev
 ```
 
 ## Run
 
 ```bash
 # Start API + dashboard
-uv run uvicorn src.api:app --host 127.0.0.1 --port 8775
+uv run --no-sync uvicorn --app-dir src api:app --host 127.0.0.1 --port 8775
 
-# Run health checks
-uv run python src/health.py
+# Verify source connectivity and current real/demo provenance
+uv run --no-sync python src/health.py
 
-# Backfill history
-uv run python src/backfill.py
+# First real-data bootstrap: reachable exchange -> historical candles -> train four real models -> seed forward journal
+# This never falls back to synthetic data; it exits nonzero if the provider or any required stage is unavailable.
+uv run --no-sync python src/bootstrap_real.py
 
-# Daily pipeline
-uv run python src/daily.py
+# Resume/backfill the available real exchange history
+uv run --no-sync python src/backfill.py
+
+# Daily orchestrated pipeline
+uv run --no-sync python src/daily.py
 
 # End-to-end verification
-uv run python src/e2e.py
+uv run --no-sync python src/e2e.py
 ```
 
 ## Tests
 
 ```bash
-uv run pytest tests/ -v
+uv run --no-sync pytest tests/ -v
 ```
 
 ## Auto-start (launchd)
