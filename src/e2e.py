@@ -113,6 +113,19 @@ def main() -> int:
           (data["real_rows"] > 0, json.dumps(data, sort_keys=True)))
     check("data", "synthetic_archive_not_served_as_production",
           (data["unknown_rows"] == 0, f"archive rows={data['synthetic_rows']}; unknown production rows={data['unknown_rows']}"))
+    migration_path = DATA / "reports" / "synthetic_migration.json"
+    try:
+        migration = json.loads(migration_path.read_text())
+        audit = migration.get("production_store_audit", {})
+        isolation_ok = (migration.get("status") == "ok"
+                        and audit.get("active_synthetic_rows") == 0
+                        and audit.get("active_unknown_rows") == 0)
+        isolation_detail = (f"status={migration.get('status')}; "
+                            f"active_synthetic={audit.get('active_synthetic_rows')}; "
+                            f"active_unknown={audit.get('active_unknown_rows')}")
+    except (OSError, ValueError, TypeError):
+        isolation_ok, isolation_detail = False, "migration report missing or unreadable"
+    check("safety", "physical_storage_isolation_verified", (isolation_ok, isolation_detail))
 
     features = build_feature_dataset(interval="1h", require_real=True)
     feature_modes = set(features["source_mode"].astype(str).unique()) if not features.empty and "source_mode" in features.columns else set()
