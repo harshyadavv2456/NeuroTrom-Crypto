@@ -22,16 +22,23 @@ SUMMARY = JOURNAL / "summary.json"
 
 def record_prediction(symbol: str, horizon: str, timestamp: datetime, predicted_return: float,
                       model_version: str, feature_version: str, price: float,
-                      source_mode: str = SOURCE_SYNTHETIC, data_quality: str = "ok") -> dict:
-    """Record a new prediction before its outcome is known."""
+                      source_mode: str = SOURCE_SYNTHETIC, data_quality: str = "ok",
+                      data_cutoff_timestamp: Optional[datetime] = None) -> dict:
+    """Record a forecast once per symbol/horizon/model/input-candle cutoff."""
     if source_mode == SOURCE_SYNTHETIC:
         log.warning("Recording SYNTHETIC prediction for %s %s — not a real market forecast", symbol, horizon)
     
+    created = pd.Timestamp(timestamp)
+    created = created.tz_localize("UTC") if created.tzinfo is None else created.tz_convert("UTC")
+    cutoff = pd.Timestamp(data_cutoff_timestamp or timestamp)
+    cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+    prediction_id = f"{symbol}_{horizon}_{model_version}_{cutoff.isoformat()}"
     pred = {
-        "prediction_id": f"{symbol}_{horizon}_{timestamp.isoformat()}",
+        "prediction_id": prediction_id,
         "symbol": symbol,
         "horizon": horizon,
-        "timestamp": timestamp.isoformat(),
+        "timestamp": created.isoformat(),
+        "data_cutoff_timestamp": cutoff.isoformat(),
         "predicted_return": float(predicted_return),
         "model_version": model_version,
         "feature_version": feature_version,
@@ -50,12 +57,19 @@ def record_prediction(symbol: str, horizon: str, timestamp: datetime, predicted_
         try:
             existing = pd.read_parquet(PREDICTIONS)
         except Exception:
-            pass
-    
+            existing = pd.DataFrame()
+
+    if not existing.empty and "prediction_id" in existing.columns:
+        already = existing[existing["prediction_id"].astype(str) == prediction_id]
+        if not already.empty:
+            return already.iloc[-1].to_dict()
+
     new_row = pd.DataFrame([pred])
     combined = pd.concat([existing, new_row], ignore_index=True)
-    combined.to_parquet(PREDICTIONS, index=False, engine="pyarrow")
-    
+    tmp = PREDICTIONS.with_suffix(".parquet.tmp")
+    combined.to_parquet(tmp, index=False, engine="pyarrow")
+    tmp.replace(PREDICTIONS)
+
     return pred
 
 
@@ -75,29 +89,26 @@ def mature_predictions(horizon: str = "24h"):
     
     for _, row in unmatured.iterrows():
         sym = row["symbol"]
-        pred_ts = pd.Timestamp(row["timestamp"])
-        pred_ts = pred_ts.tz_localize("UTC") if pred_ts.tzinfo is None else pred_ts.tz_convert("UTC")
-        entry_price = row["price_at_prediction"]
+        cutoff_value = row.get("data_cutoff_timestamp", row["timestamp"])
+        cutoff = pd.Timestamp(cutoff_value)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        entry_price = float(row["price_at_prediction"])
         bars = int(HORIZON_BARS.get(horizon, 24))
 
-        df = get_candles(sym, "1h", "spot", start=pred_ts, end=pred_ts + pd.Timedelta(hours=bars * 2))
+        df = get_candles(sym, "1h", "spot", start=cutoff + pd.Timedelta(hours=1),
+                         end=cutoff + pd.Timedelta(hours=bars + 3))
         if df.empty or "source_mode" not in df.columns:
             continue
-        # Only exchange-derived bars may score a real prediction; synthetic and
-        # unprovenanced records must never silently complete a live forecast.
         df = df[df["source_mode"].isin([SOURCE_LIVE, SOURCE_HISTORICAL])].copy()
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        if df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+        if len(df) < bars:
             continue
-        # Anchor the evaluation on the input candle timestamp saved with the prediction.
-        df = df[df["timestamp"] >= pred_ts].reset_index(drop=True)
-        if len(df) <= bars:
-            continue
-        
-        exit_price = df.iloc[bars]["close"]
+
+        exit_price = float(df.iloc[bars - 1]["close"])
         actual_ret = (exit_price / entry_price) - 1
         
-        idx = preds.index[(preds["symbol"] == sym) & (preds["horizon"] == horizon) & (preds["timestamp"] == row["timestamp"])]
+        idx = preds.index[preds["prediction_id"].astype(str) == str(row["prediction_id"])]
         if not idx.empty:
             preds.loc[idx, "matured"] = True
             preds.loc[idx, "outcome"] = "filled"
