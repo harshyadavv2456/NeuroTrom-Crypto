@@ -37,7 +37,8 @@ def _now_iso():
 
 
 def _add_provenance(df: pd.DataFrame, source_mode: str, provider: str) -> pd.DataFrame:
-    """Add provenance columns to a DataFrame of candles."""
+    """Add missing provenance columns without overwriting verified source labels."""
+    df = df.copy()
     if "ingested_at" not in df.columns:
         df["ingested_at"] = _now_iso()
     if "source_mode" not in df.columns:
@@ -45,6 +46,23 @@ def _add_provenance(df: pd.DataFrame, source_mode: str, provider: str) -> pd.Dat
     if "provider" not in df.columns:
         df["provider"] = provider
     return df
+
+
+def _dedupe_candles(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
+    """Resolve duplicate bars in favor of live exchange rows, then trusted history, then demo."""
+    if df.empty or time_col not in df.columns:
+        return df
+    work = df.copy()
+    work[time_col] = pd.to_datetime(work[time_col], utc=True, errors="coerce")
+    priority = {"SYNTHETIC_DEMO": 0, "HISTORICAL_EXCHANGE": 1, "LIVE_EXCHANGE": 2}
+    work["_source_priority"] = work.get("source_mode", pd.Series(index=work.index, dtype=str)).map(priority).fillna(-1)
+    if "ingested_at" in work.columns:
+        work["_ingested_sort"] = pd.to_datetime(work["ingested_at"], utc=True, errors="coerce")
+    else:
+        work["_ingested_sort"] = pd.NaT
+    work = work.dropna(subset=[time_col]).sort_values([time_col, "_source_priority", "_ingested_sort"])
+    work = work.drop_duplicates(subset=[time_col], keep="last")
+    return work.drop(columns=["_source_priority", "_ingested_sort"], errors="ignore").reset_index(drop=True)
 
 
 # ---- Binance REST OHLCV ----
@@ -86,7 +104,13 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
     """Append candles to Parquet, deduplicating on (symbol, interval, open_time)."""
     if df.empty:
         return 0
-    
+
+    df = _add_provenance(df, source_mode, provider)
+    if "open_time" not in df.columns and "time" in df.columns:
+        df = df.rename(columns={"time": "open_time"})
+    if "open_time" not in df.columns:
+        raise ValueError("Cannot save candles without open_time/timestamp provenance")
+
     raw_dir = RAW / market_type / symbol
     raw_dir.mkdir(parents=True, exist_ok=True)
     raw_path = raw_dir / f"{interval}.parquet"
@@ -101,9 +125,7 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
             log.warning("Could not read existing parquet %s: %s", raw_path, e)
             existing = pd.DataFrame()
     
-    combined = pd.concat([existing, df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["open_time"], keep="last")
-    combined = combined.sort_values("open_time").reset_index(drop=True)
+    combined = _dedupe_candles(pd.concat([existing, df], ignore_index=True), "open_time")
     
     bad = (combined["high"] < combined["low"]) | (combined["high"] < combined["open"]) | (combined["high"] < combined["close"]) | (combined["low"] > combined["open"]) | (combined["low"] > combined["close"])
     before = len(combined)
@@ -126,7 +148,7 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
         try:
             old = pd.read_parquet(norm_path)
             old["timestamp"] = pd.to_datetime(old["timestamp"], utc=True)
-            norm_df = pd.concat([old, norm_df], ignore_index=True).drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+            norm_df = _dedupe_candles(pd.concat([old, norm_df], ignore_index=True), "timestamp")
         except Exception:
             pass
     norm_df.to_parquet(norm_path, index=False, engine="pyarrow")
@@ -273,7 +295,11 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
     current_start = datetime.fromisoformat(ckpt.get("current_start", start.isoformat()))
     total_rows = ckpt.get("total_rows", 0)
     
-    existing_end = get_last_timestamp(symbol, interval, market_type)
+    # Synthetic timestamps must never make a real-provider backfill look complete.
+    existing_real = get_candles(symbol, interval, market_type, source_mode=SOURCE_HISTORICAL)
+    if not existing_real.empty and "provider" in existing_real.columns:
+        existing_real = existing_real[existing_real["provider"].astype(str).str.lower() == provider.lower()]
+    existing_end = existing_real["timestamp"].max().to_pydatetime() if not existing_real.empty else None
     if existing_end and existing_end >= end - pd.Timedelta(hours=2):
         log.info("Backfill for %s %s %s already complete through %s", symbol, interval, market_type, existing_end)
         return total_rows
