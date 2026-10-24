@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 45
     environment:
       name: github-pages
-      url: \${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,10 +47,10 @@ jobs:
 
       - name: Install Kaggle CLI only when an input dataset is configured
         env:
-          KAGGLE_INPUT_DATASET: \${{ vars.KAGGLE_INPUT_DATASET }}
-          KAGGLE_USERNAME: \${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: \${{ secrets.KAGGLE_KEY }}
-          KAGGLE_API_TOKEN: \${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_INPUT_DATASET: ${{ vars.KAGGLE_INPUT_DATASET }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           if [[ -n "$KAGGLE_INPUT_DATASET" && ( -n "$KAGGLE_API_TOKEN" || ( -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ) ) ]]; then
             uv pip install --python .venv/bin/python kaggle
@@ -64,10 +64,10 @@ jobs:
       - name: Run cloud ingest, model training, evaluation and forecast
         id: pipeline
         env:
-          KAGGLE_INPUT_DATASET: \${{ vars.KAGGLE_INPUT_DATASET }}
-          KAGGLE_USERNAME: \${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: \${{ secrets.KAGGLE_KEY }}
-          KAGGLE_API_TOKEN: \${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_INPUT_DATASET: ${{ vars.KAGGLE_INPUT_DATASET }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_STALE_AFTER_DAYS: "7"
           NEUROTROM_HISTORY_DAYS: "365"
           PYTHONUNBUFFERED: "1"
