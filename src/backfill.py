@@ -128,89 +128,84 @@ def backfill_fine_grain(symbols: list[str] = None, days: int = 30):
 
 
 def verify_backfill(symbol: str, interval: str, market_type: str = "spot") -> dict:
-    """Report real exchange quality separately from demo-only data."""
-    all_df = get_candles(symbol, interval, market_type)
-    if all_df.empty:
-        return {
-            "status": "empty",
-            "rows": 0,
-            "real_rows": 0,
-            "synthetic_rows": 0,
-            "source_mode": "NONE",
-            "note": "No stored candles",
-        }
-
-    if "source_mode" not in all_df.columns:
-        real_df = pd.DataFrame()
-        synthetic_rows = 0
-        unknown_rows = len(all_df)
-    else:
-        modes = all_df["source_mode"].astype(str)
-        real_mask = modes.isin(["LIVE_EXCHANGE", "HISTORICAL_EXCHANGE"])
-        synthetic_rows = int(modes.eq("SYNTHETIC_DEMO").sum())
-        unknown_rows = int((~real_mask & ~modes.eq("SYNTHETIC_DEMO")).sum())
-        real_df = all_df.loc[real_mask].copy()
+    """Report production exchange candles and isolated demo archives separately."""
+    real_df = get_candles(symbol, interval, market_type)
+    demo_df = get_candles(symbol, interval, market_type, source_mode="SYNTHETIC_DEMO")
+    synthetic_rows = int(len(demo_df))
 
     if real_df.empty:
-        status = "demo_only" if synthetic_rows else "unknown_provenance"
+        status = "demo_only" if synthetic_rows else "empty"
         return {
             "status": status,
             "rows": 0,
             "real_rows": 0,
             "synthetic_rows": synthetic_rows,
-            "unknown_rows": unknown_rows,
+            "source_mode": "SYNTHETIC_DEMO" if synthetic_rows else "NONE",
             "first": None,
             "last": None,
             "age_hours": None,
             "gap_pct": None,
-            "market": market_type,
-            "source_mode": "SYNTHETIC_DEMO" if synthetic_rows else "UNKNOWN",
-            "note": "No verified exchange candles; demo data is excluded from real-data quality.",
+            "note": "No verified exchange candles; isolated demo rows are never reported as real data.",
         }
 
-    real_df["timestamp"] = pd.to_datetime(real_df["timestamp"], utc=True, errors="coerce")
-    real_df = real_df.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    if "source_mode" not in real_df.columns:
+        return {
+            "status": "unknown_provenance",
+            "rows": 0,
+            "real_rows": 0,
+            "synthetic_rows": synthetic_rows,
+            "source_mode": "UNKNOWN",
+            "note": "Production dataset is missing provenance.",
+        }
+
+    df = real_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    real_mask = df["source_mode"].astype(str).isin(["LIVE_EXCHANGE", "HISTORICAL_EXCHANGE"])
+    if not bool(real_mask.all()):
+        return {
+            "status": "unknown_provenance",
+            "rows": int(len(df)),
+            "real_rows": int(real_mask.sum()),
+            "production_nonreal_rows": int((~real_mask).sum()),
+            "synthetic_rows": synthetic_rows,
+            "source_mode": "MIXED_OR_UNKNOWN",
+            "note": "Non-real records were found in a production read.",
+        }
+
     now = datetime.now(timezone.utc)
-    first = real_df["timestamp"].min().to_pydatetime()
-    last = real_df["timestamp"].max().to_pydatetime()
+    first = df["timestamp"].min().to_pydatetime()
+    last = df["timestamp"].max().to_pydatetime()
     age_hours = max(0.0, (now - last).total_seconds() / 3600)
 
     expected = {"1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
                 "15m": pd.Timedelta(minutes=15), "30m": pd.Timedelta(minutes=30),
                 "1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4),
                 "1d": pd.Timedelta(days=1), "7d": pd.Timedelta(days=7)}.get(interval)
-    if expected and len(real_df) > 1:
+    if expected and len(df) > 1:
         expected_rows = int((last - first) / expected) + 1
-        missing_rows = max(0, expected_rows - int(real_df["timestamp"].nunique()))
+        missing_rows = max(0, expected_rows - int(df["timestamp"].nunique()))
         gap_pct = 100.0 * missing_rows / max(1, expected_rows)
     else:
-        gap_pct = 0.0 if len(real_df) else None
+        gap_pct = 0.0
 
-    modes = set(real_df["source_mode"].astype(str).unique()) if "source_mode" in real_df.columns else {"UNKNOWN"}
-    providers = sorted(set(real_df["provider"].astype(str).unique())) if "provider" in real_df.columns else ["unknown"]
     freshness_limit = 3.5 if interval in ("1m", "5m", "15m", "30m", "1h", "4h") else 30.0
-    if age_hours > freshness_limit:
-        status = "stale"
-    elif gap_pct is not None and gap_pct > 5:
-        status = "gaps"
-    else:
-        status = "ok"
-
-    source_label = next(iter(modes)) if len(modes) == 1 else "REAL_EXCHANGE_MIXED"
+    status = "stale" if age_hours > freshness_limit else ("gaps" if gap_pct > 5 else "ok")
+    providers = sorted(set(df["provider"].astype(str))) if "provider" in df.columns else ["unknown"]
+    modes = set(df["source_mode"].astype(str).unique())
     return {
         "status": status,
-        "rows": int(len(real_df)),
-        "real_rows": int(len(real_df)),
+        "rows": int(len(df)),
+        "real_rows": int(len(df)),
         "synthetic_rows": synthetic_rows,
-        "unknown_rows": unknown_rows,
         "first": first.isoformat(),
         "last": last.isoformat(),
         "age_hours": round(age_hours, 2),
-        "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,
+        "gap_pct": round(gap_pct, 2),
         "market": market_type,
-        "source_mode": source_label,
+        "source_mode": next(iter(modes)) if len(modes) == 1 else "REAL_EXCHANGE_MIXED",
         "providers": providers,
-        "note": "Real exchange observations only; synthetic rows excluded.",
+        "note": "Only exchange-derived production observations are scored; demo archive is separate.",
     }
 
 def reconcile_gaps():
