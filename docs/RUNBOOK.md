@@ -15,8 +15,9 @@ GitHub Actions runs `.github/workflows/daily-research.yml` daily at 00:47 UTC (a
 1. Set the repository visibility to public after scanning tracked files and history for credentials and removing the historical FinVest parity document.
 2. Under Settings → Pages, set the publishing source to GitHub Actions.
 3. Enable Actions for the repository.
-4. Optionally set repository variable `KAGGLE_INPUT_DATASET` and configure secrets `KAGGLE_API_TOKEN` or `KAGGLE_USERNAME` plus `KAGGLE_KEY`.
-5. After confirming the Kaggle source's licence and data timestamps, manually run the daily workflow and inspect its full log.
+4. To use historical Kaggle input, set repository variable `KAGGLE_INPUT_DATASET` and configure secret `KAGGLE_API_TOKEN` or `KAGGLE_USERNAME` plus `KAGGLE_KEY`.
+5. To version a separate Kaggle daily-snapshot dataset automatically, set `KAGGLE_OUTPUT_DATASET` to its exact owner/slug and `KAGGLE_OUTPUT_PUBLISH=true`. Never use the same dataset for input and output; the workflow blocks that configuration.
+6. Review the input/output dataset licenses and actual candle timestamps, then manually run the daily workflow and inspect its full log.
 
 ## Kaggle freshness
 
