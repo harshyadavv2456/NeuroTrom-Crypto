@@ -592,6 +592,16 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
                 if not df.empty:
                     df = df[(df["open_time"] >= pd.Timestamp(effective_start)) &
                             (df["open_time"] <= pd.Timestamp(end))]
+            elif provider == "coindcx":
+                step_ms = {"1m": 60_000, "15m": 900_000, "1h": 3_600_000, "1d": 86_400_000}
+                if interval not in step_ms:
+                    raise ValueError(f"Unsupported CoinDCX candle interval: {interval}")
+                chunk_end = min(end, cur + pd.Timedelta(milliseconds=step_ms[interval] * (batch - 1)))
+                df = coindcx_ohlc(symbol, interval=interval, start_ms=start_ms,
+                                  end_ms=int(chunk_end.timestamp() * 1000), limit=batch)
+                if not df.empty:
+                    df = df[(df["open_time"] >= pd.Timestamp(cur)) &
+                            (df["open_time"] <= pd.Timestamp(chunk_end))]
             else:
                 raise ValueError(f"Unknown provider: {provider}")
             
@@ -601,7 +611,11 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
             written = save_candles(df, symbol, interval, market_type, source_mode=SOURCE_HISTORICAL, provider=provider)
             total_rows += written
             new_end = df["open_time"].max().to_pydatetime() if "open_time" in df.columns else df["time"].max().to_pydatetime()
-            cur = new_end + pd.Timedelta(milliseconds=1)
+            if provider == "coindcx":
+                step_ms = {"1m": 60_000, "15m": 900_000, "1h": 3_600_000, "1d": 86_400_000}[interval]
+                cur = new_end + pd.Timedelta(milliseconds=step_ms)
+            else:
+                cur = new_end + pd.Timedelta(milliseconds=1)
             consecutive_errors = 0
             
             ckpt_path.write_text(json.dumps({
@@ -696,7 +710,7 @@ def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binanc
     """Fetch 24-hour ticker metadata from the named provider or first approved reachable provider."""
     if provider == "auto":
         errors = []
-        for candidate in ("binance", "kraken"):
+        for candidate in ("binance", "kraken", "coindcx"):
             try:
                 return fetch_ticker(symbol, market_type, candidate)
             except Exception as exc:
