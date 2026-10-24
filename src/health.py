@@ -31,7 +31,7 @@ def active_real_universe() -> pd.DataFrame:
     df = load_universe()
     if df.empty or "exchange" not in df.columns:
         return pd.DataFrame()
-    df = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    df = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken", "coindcx"])].copy()
     if "universe_provenance" in df.columns:
         df = df[df["universe_provenance"].astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])]
     if "status" in df.columns:
@@ -94,7 +94,7 @@ def main() -> int:
 
     providers = {
         name: test_provider_connectivity(name)
-        for name in ("binance", "kraken")
+        for name in ("binance", "kraken", "coindcx")
     }
     any_provider = any(x.get("reachable", False) for x in providers.values())
     for name, status in providers.items():
