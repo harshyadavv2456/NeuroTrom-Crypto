@@ -34,7 +34,10 @@ KAGGLE_DIR = WORK / "kaggle"
 WORK.mkdir(parents=True, exist_ok=True)
 OUT.mkdir(parents=True, exist_ok=True)
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "ADAUSDT", "DOGEUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT",
+]
 HORIZONS = {"1h": 1, "4h": 4, "24h": 24, "7d": 168}
 BINANCE_HOSTS = [
     "https://data-api.binance.vision",
@@ -589,14 +592,21 @@ def publish_outputs(tickers: dict, data: dict[str, pd.DataFrame], models: dict,
             age = (now - pd.Timestamp(frame["timestamp"].max()).to_pydatetime()).total_seconds() / 3600
             if age <= 2.5:
                 fresh_symbols.append(symbol)
-    overall = "OK" if len(fresh_symbols) >= 3 and models.get("ready_count") == len(HORIZONS) else "DEGRADED"
+    ticker_symbols = sorted(latest_by_symbol)
+    overall = "OK" if len(fresh_symbols) >= 3 and len(ticker_symbols) >= 3 and models.get("ready_count") == len(HORIZONS) else "DEGRADED"
     payload = {
         "project": "NeuroTrom Crypto Research",
         "generated_at": now.isoformat(),
         "run": {"commit": os.getenv("GITHUB_SHA", "local"), "run_id": os.getenv("GITHUB_RUN_ID"), "workflow": os.getenv("GITHUB_WORKFLOW")},
         "status": overall,
         "status_note": "Research-only. Historical model validation is not proof of profitability. No order execution.",
-        "provider": {"name": "Binance Spot public REST", "host_checks": host_checks, "fresh_symbols": fresh_symbols},
+        "provider": {
+            "name": "Binance Spot public REST",
+            "host_checks": host_checks,
+            "fresh_symbols": fresh_symbols,
+            "ticker_symbols": ticker_symbols,
+            "requested_symbols": SYMBOLS,
+        },
         "kaggle": kaggle_status,
         "market": list(latest_by_symbol.values()),
         "models": models,
