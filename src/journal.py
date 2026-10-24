@@ -152,14 +152,19 @@ def compute_journal_summary() -> dict:
     synthetic = int(synthetic_mask.sum())
     unknown = int(total - real - synthetic)
     
-    matured = preds[preds["matured"] == True].copy()
-    
+    matured_all = preds[preds["matured"] == True].copy()
+    # Performance metrics must exclude forecasts generated from synthetic or
+    # unknown-provenance data even if their eventual outcome came from real bars.
+    matured = matured_all[matured_all["source_mode"].astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])].copy() if "source_mode" in matured_all.columns else pd.DataFrame()
+    matured_synthetic = int((matured_all.get("source_mode", pd.Series(dtype=str)).astype(str) == SOURCE_SYNTHETIC).sum()) if not matured_all.empty else 0
+
     summary = {
         "total_predictions": total,
         "real_predictions": real,
         "synthetic_predictions": synthetic,
         "unknown_provenance_predictions": unknown,
         "matured": len(matured),
+        "matured_synthetic": matured_synthetic,
         "by_horizon": {},
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
