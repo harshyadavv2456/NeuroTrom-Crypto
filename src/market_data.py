@@ -194,6 +194,12 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
     return written
 
 
+def _utc_timestamp(value) -> pd.Timestamp:
+    """Normalize naive or aware timestamps safely to UTC."""
+    stamp = pd.Timestamp(value)
+    return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+
+
 def get_candles(symbol: str, interval: str, market_type: str = "spot", start: Optional[datetime] = None, end: Optional[datetime] = None, source_mode: Optional[str] = None) -> pd.DataFrame:
     """Read stored candles from normalized market dir. Optionally filter by source_mode."""
     path = MARKET / market_type / symbol / f"{interval}.parquet"
@@ -207,9 +213,9 @@ def get_candles(symbol: str, interval: str, market_type: str = "spot", start: Op
             return pd.DataFrame()
         df = df[df["source_mode"] == source_mode]
     if start:
-        df = df[df["timestamp"] >= pd.Timestamp(start, tz="UTC")]
+        df = df[df["timestamp"] >= _utc_timestamp(start)]
     if end:
-        df = df[df["timestamp"] <= pd.Timestamp(end, tz="UTC")]
+        df = df[df["timestamp"] <= _utc_timestamp(end)]
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
