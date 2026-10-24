@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Data and models (never commit)
+data/
+market/
+features/
+models/
+runs/
+journal/
+state/
+logs/
+reports/
+raw/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.pem
+*.key
+
+# Large files
+*.parquet
+*.csv
+*.gguf
+*.safetensors
+
+# Local config
+config.local.yaml
+config.local.json
+api.pid
+run_train.py
+*.pid
