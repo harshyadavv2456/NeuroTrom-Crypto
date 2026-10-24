@@ -83,7 +83,7 @@ def main():
         steps.append({"step": "train", "ok": False, "error": "skipped: no real features"})
     
     # 5. Mature predictions
-    for h in ["1h", "4h", "24h"]:
+    for h in ["1h", "4h", "24h", "7d"]:
         steps.append(run_step(f"mature_{h}", lambda hh=h: mature_predictions(hh), retries=0))
     
     # 6. Journal summary
