@@ -427,15 +427,25 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
                     continue
                 if not np.isfinite(predicted_return):
                     continue
-                price = float(current_ticker["price"])
+                # The model return is defined relative to the completed candle
+                # close used to construct its features, not the later live ticker.
+                reference_close = float(frame["close"].iloc[-1])
+                predicted_at = utc_now().isoformat()
                 predictions.append({
+                    "journal_id": f"{predicted_at}:{symbol}:{horizon}:{os.getenv('GITHUB_RUN_ID', 'local')}",
+                    "run_id": os.getenv("GITHUB_RUN_ID", "local"),
                     "symbol": symbol, "horizon": horizon,
-                    "last_price": price, "predicted_return_pct": round(predicted_return * 100, 3),
-                    "implied_target_price": round(price * (1 + predicted_return), 8),
+                    "last_price": reference_close,
+                    "current_ticker_price": float(current_ticker["price"]),
+                    "entry_price": reference_close,
+                    "predicted_return_pct": round(predicted_return * 100, 3),
+                    "implied_target_price": round(max(0.0, reference_close * (1 + predicted_return)), 8),
                     "input_candle_time": iso(frame["timestamp"].iloc[-1]),
+                    "forecasted_at": predicted_at,
                     "input_age_hours": round(max(0, (utc_now() - pd.Timestamp(frame["timestamp"].iloc[-1]).to_pydatetime()).total_seconds() / 3600), 2),
                     "data_source": "Binance Spot public REST",
                     "model_provenance": "BINANCE_PUBLIC_REST",
+                    "matured": False,
                 })
         except Exception as exc:
             model_report["models"][horizon] = {"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:220]}"}
@@ -444,9 +454,98 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
     return model_report, predictions
 
 
+def load_public_journal() -> list[dict]:
+    """Recover prior daily forecast records from the currently deployed Pages site."""
+    repository = os.getenv("GITHUB_REPOSITORY", "harshyadavv2456/NeuroTrom-Crypto")
+    try:
+        owner, name = repository.split("/", 1)
+        url = f"https://{owner}.github.io/{name}/data/journal.json"
+        response = requests.get(url, params={"cache": str(int(time.time()))}, timeout=(2, 5),
+                                headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+        if response.status_code != 200:
+            return []
+        payload = response.json()
+        records = payload.get("predictions", []) if isinstance(payload, dict) else []
+        return [x for x in records if isinstance(x, dict) and x.get("journal_id")]
+    except Exception as exc:
+        LOG.info("No previous public journal loaded: %s", str(exc)[:180])
+        return []
+
+
+def update_journal(previous: list[dict], new_predictions: list[dict],
+                   data: dict[str, pd.DataFrame]) -> tuple[list[dict], dict]:
+    """Mature old forecasts against later completed candles, then append this run."""
+    records = [dict(x) for x in previous]
+    by_id = {str(x.get("journal_id")): i for i, x in enumerate(records)}
+    for item in records:
+        if item.get("matured"):
+            continue
+        symbol = str(item.get("symbol", ""))
+        horizon = str(item.get("horizon", ""))
+        frame = data.get(symbol)
+        if frame is None or frame.empty or horizon not in HORIZONS:
+            continue
+        try:
+            input_time = pd.Timestamp(item["input_candle_time"])
+            if input_time.tzinfo is None:
+                input_time = input_time.tz_localize("UTC")
+            target_time = input_time + pd.Timedelta(hours=HORIZONS[horizon])
+            eligible = frame[frame["timestamp"] >= target_time].sort_values("timestamp")
+            if eligible.empty:
+                continue
+            actual = eligible.iloc[0]
+            entry = float(item.get("entry_price", item["last_price"]))
+            actual_close = float(actual["close"])
+            if entry <= 0 or not np.isfinite(actual_close):
+                continue
+            realized = actual_close / entry - 1
+            predicted = float(item["predicted_return_pct"]) / 100
+            item.update({
+                "matured": True,
+                "matured_at": utc_now().isoformat(),
+                "actual_candle_time": iso(actual["timestamp"]),
+                "actual_close": actual_close,
+                "actual_return_pct": round(realized * 100, 4),
+                "directional_correct": bool(np.sign(predicted) == np.sign(realized)),
+            })
+        except Exception as exc:
+            LOG.debug("Could not mature journal row: %s", str(exc)[:120])
+    for item in new_predictions:
+        key = str(item.get("journal_id", ""))
+        if key and key not in by_id:
+            by_id[key] = len(records)
+            records.append(dict(item))
+    records = records[-10000:]
+    matured = [x for x in records if x.get("matured") and num_finite(x.get("actual_return_pct"))]
+    by_horizon = {}
+    for horizon in HORIZONS:
+        subset = [x for x in matured if x.get("horizon") == horizon]
+        by_horizon[horizon] = {
+            "matured": len(subset),
+            "directional_accuracy": round(sum(bool(x.get("directional_correct")) for x in subset) / len(subset), 4) if subset else None,
+            "mean_actual_return_pct": round(float(np.mean([float(x["actual_return_pct"]) for x in subset])), 4) if subset else None,
+        }
+    summary = {
+        "total_predictions": len(records),
+        "matured_predictions": len(matured),
+        "pending_predictions": len(records) - len(matured),
+        "directional_accuracy": round(sum(bool(x.get("directional_correct")) for x in matured) / len(matured), 4) if matured else None,
+        "mean_actual_return_pct": round(float(np.mean([float(x["actual_return_pct"]) for x in matured])), 4) if matured else None,
+        "by_horizon": by_horizon,
+    }
+    return records, summary
+
+
+def num_finite(value: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
 def publish_outputs(tickers: dict, data: dict[str, pd.DataFrame], models: dict,
                     predictions: list[dict], kaggle_status: dict, host_checks: list[dict],
-                    errors: list[str]) -> None:
+                    errors: list[str], journal: list[dict], journal_summary: dict) -> None:
     now = utc_now()
     latest_by_symbol = {}
     history_series = {}
@@ -479,11 +578,13 @@ def publish_outputs(tickers: dict, data: dict[str, pd.DataFrame], models: dict,
         "market": list(latest_by_symbol.values()),
         "models": models,
         "predictions": predictions,
+        "journal": journal_summary,
         "errors": errors[-30:],
         "limits": {"historical_days_requested": HISTORY_DAYS, "symbols_requested": SYMBOLS, "history_series_points_per_symbol": 168},
     }
     write_json(OUT / "latest.json", payload)
     write_json(OUT / "history.json", {"generated_at": now.isoformat(), "interval": "1h", "series": history_series})
+    write_json(OUT / "journal.json", {"updated_at": now.isoformat(), "predictions": journal})
     rows = []
     by_key = {(p["symbol"], p["horizon"]): p for p in predictions}
     for symbol in SYMBOLS:
@@ -522,11 +623,13 @@ def main() -> int:
     tickers: dict[str, dict] = {}
     kaggle_status, kaggle_frames = load_kaggle_source()
 
+    previous_journal = load_public_journal()
     if host is None:
         errors.append("No Binance public REST host was reachable from this runner.")
         kaggle_status.setdefault("reason", "Live API host unreachable; dashboard will report degraded status.")
         models = {"status": "blocked", "models": {}, "ready_count": 0, "reason": errors[0]}
-        publish_outputs(tickers, data, models, [], kaggle_status, host_checks, errors)
+        journal, journal_summary = update_journal(previous_journal, [], data)
+        publish_outputs(tickers, data, models, [], kaggle_status, host_checks, errors, journal, journal_summary)
         return 2
 
     for symbol in SYMBOLS:
@@ -556,7 +659,8 @@ def main() -> int:
                 data[symbol] = kaggle_frames[symbol].copy()
                 errors.append(f"{symbol}: using compatible historical Kaggle candles only; they are not current API data.")
     models, predictions = train_models(data, tickers)
-    publish_outputs(tickers, data, models, predictions, kaggle_status, host_checks, errors)
+    journal, journal_summary = update_journal(previous_journal, predictions, data)
+    publish_outputs(tickers, data, models, predictions, kaggle_status, host_checks, errors, journal, journal_summary)
     runtime_s = round((utc_now() - started).total_seconds(), 1)
     LOG.info("Cloud refresh finished in %ss; live symbols=%s; models=%s; errors=%s",
              runtime_s, len(tickers), models.get("ready_count", 0), len(errors))
