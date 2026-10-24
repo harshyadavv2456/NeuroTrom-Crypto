@@ -176,12 +176,17 @@ def verify_backfill(symbol: str, interval: str, market_type: str = "spot") -> di
     now = datetime.now(timezone.utc)
     first = df["timestamp"].min().to_pydatetime()
     last = df["timestamp"].max().to_pydatetime()
-    age_hours = max(0.0, (now - last).total_seconds() / 3600)
 
     expected = {"1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
                 "15m": pd.Timedelta(minutes=15), "30m": pd.Timedelta(minutes=30),
                 "1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4),
                 "1d": pd.Timedelta(days=1), "7d": pd.Timedelta(days=7)}.get(interval)
+    # Candle timestamps label the bar's OPEN, not when it became available.
+    # Calculate staleness from the expected bar close to avoid mislabelling a
+    # perfectly current daily candle as 24 hours older than it really is.
+    latest_close = last + expected if expected else last
+    age_hours = max(0.0, (now - latest_close).total_seconds() / 3600)
+
     if expected and len(df) > 1:
         expected_rows = int((last - first) / expected) + 1
         missing_rows = max(0, expected_rows - int(df["timestamp"].nunique()))
