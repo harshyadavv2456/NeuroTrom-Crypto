@@ -31,7 +31,8 @@ def run_step(name: str, fn, retries: int = 1):
             result = fn()
             elapsed = time.time() - t0
             log.info("Step %s OK in %.1fs", name, elapsed)
-            return {"step": name, "ok": True, "elapsed": round(elapsed, 1), "result": str(result)[:500]}
+            safe_result = result if isinstance(result, (dict, list, int, float, bool)) or result is None else str(result)[:500]
+            return {"step": name, "ok": True, "elapsed": round(elapsed, 1), "result": safe_result}
         except Exception as e:
             log.error("Step %s failed: %s", name, e)
             if attempt >= retries:
@@ -98,6 +99,12 @@ def main():
         "steps": {s["step"]: s for s in steps},
     }
     STATUS.write_text(json.dumps(status, indent=2, default=str))
+    history_path = DATA / "models" / "run_history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open("a", encoding="utf-8") as history:
+        history.write(json.dumps({"started": started, "finished": finished, "ok": ok,
+                                  "steps": {step["step"]: step.get("ok", False) for step in steps}},
+                                 default=str) + "\\n")
     
     log.info("=== Daily pipeline finished %s: %s ===", finished, "OK" if ok else "FAILED")
     return 0 if ok else 1
