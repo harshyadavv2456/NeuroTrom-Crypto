@@ -746,6 +746,42 @@ def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binanc
             "transport": response.headers.get("X-NeuroTrom-Transport", "requests"),
         }
 
+    if provider == "coindcx":
+        if market_type != "spot":
+            raise ValueError("CoinDCX adapter supports public spot market data only")
+        global _COINDCX_TICKERS_CACHE, _COINDCX_TICKERS_CACHE_AT
+        now = time.monotonic()
+        if not _COINDCX_TICKERS_CACHE or now - _COINDCX_TICKERS_CACHE_AT > 1.5:
+            response = http_get(f"{COINDCX_REST}/exchange/ticker", timeout=10)
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("Unexpected CoinDCX ticker response")
+            _COINDCX_TICKERS_CACHE = {
+                str(item.get("market", "")).upper(): item
+                for item in payload if isinstance(item, dict) and item.get("market")
+            }
+            _COINDCX_TICKERS_CACHE_AT = now
+        key = str(symbol).upper().replace("/", "").replace("-", "")
+        item = _COINDCX_TICKERS_CACHE.get(key)
+        if item is None:
+            raise ValueError(f"CoinDCX ticker has no exact market for {symbol}")
+        try:
+            stamp = pd.to_datetime(int(item.get("timestamp")), unit="ms", utc=True).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            stamp = _now_iso()
+        return {
+            "symbol": key,
+            "price": float(item["last_price"]),
+            "change_pct": float(item["change_24_hour"]) if item.get("change_24_hour") is not None else None,
+            "volume": float(item["volume"]) if item.get("volume") is not None else None,
+            "high": float(item["high"]) if item.get("high") is not None else None,
+            "low": float(item["low"]) if item.get("low") is not None else None,
+            "provider": "coindcx",
+            "source_mode": SOURCE_LIVE,
+            "timestamp": stamp,
+            "transport": response.headers.get("X-NeuroTrom-Transport", "requests") if "response" in locals() else "ticker-cache",
+        }
+
     raise ValueError(f"Unknown provider: {provider}")
 
 def test_provider_connectivity(provider: str = "binance") -> dict:
@@ -781,6 +817,15 @@ def test_provider_connectivity(provider: str = "binance") -> dict:
             return {"provider": "kraken", "reachable": r.status_code == 200, "latency_ms": round((time.monotonic() - t0) * 1000, 1), "transport": r.headers.get("X-NeuroTrom-Transport", "requests")}
         except Exception as e:
             return {"provider": "kraken", "reachable": False, "error": str(e)}
+    elif provider == "coindcx":
+        try:
+            t0 = time.monotonic()
+            r = http_get(f"{COINDCX_REST}/exchange/ticker", timeout=8)
+            data = r.json()
+            reachable = isinstance(data, list) and len(data) > 0
+            return {"provider": "coindcx", "reachable": reachable, "latency_ms": round((time.monotonic() - t0) * 1000, 1), "transport": r.headers.get("X-NeuroTrom-Transport", "requests")}
+        except Exception as e:
+            return {"provider": "coindcx", "reachable": False, "error": str(e)}
     else:
         return {"provider": provider, "reachable": False, "error": "Unknown provider"}
 
