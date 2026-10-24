@@ -71,3 +71,28 @@ def test_feature_generation_returns_only_lagged_market_features():
     assert "label_7d" not in result
     assert pd.isna(result.iloc[0]["ret_1"])
     assert result["ret_1"].iloc[-1] > 0
+
+
+def test_forecast_journal_matures_only_after_target_candle_exists():
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=4, freq="h", tz="UTC"),
+        "close": [100.0, 110.0, 108.0, 112.0],
+        "symbol": ["BTCUSDT"] * 4,
+        "source": ["BINANCE_PUBLIC_REST"] * 4,
+    })
+    record = {
+        "journal_id": "run-1:BTCUSDT:1h",
+        "symbol": "BTCUSDT",
+        "horizon": "1h",
+        "input_candle_time": "2026-01-01T00:00:00+00:00",
+        "entry_price": 100.0,
+        "last_price": 100.0,
+        "predicted_return_pct": 5.0,
+        "matured": False,
+    }
+    journal, summary = cp.update_journal([record], [], {"BTCUSDT": frame})
+    assert journal[0]["matured"] is True
+    assert journal[0]["actual_return_pct"] == 10.0
+    assert journal[0]["directional_correct"] is True
+    assert summary["matured_predictions"] == 1
+    assert summary["directional_accuracy"] == 1.0
