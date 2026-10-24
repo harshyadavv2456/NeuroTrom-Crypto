@@ -123,38 +123,90 @@ def backfill_fine_grain(symbols: list[str] = None, days: int = 30):
 
 
 def verify_backfill(symbol: str, interval: str, market_type: str = "spot") -> dict:
-    """Check backfill status for one symbol."""
-    df = get_candles(symbol, interval, market_type)
-    if df.empty:
-        return {"status": "empty", "rows": 0}
-    
-    now = datetime.now(timezone.utc)
-    last = df["timestamp"].max().to_pydatetime()
-    age_hours = (now - last).total_seconds() / 3600
-    
-    # Check for gaps
-    if len(df) > 1:
-        diffs = df["timestamp"].diff().dropna()
-        expected = pd.Timedelta(hours=1) if interval == "1h" else pd.Timedelta(days=1) if interval == "1d" else pd.Timedelta(minutes=1)
-        gap_threshold = expected * 3
-        gaps = diffs[diffs > gap_threshold]
-        gap_pct = len(gaps) / len(diffs) * 100
+    """Report real exchange quality separately from demo-only data."""
+    all_df = get_candles(symbol, interval, market_type)
+    if all_df.empty:
+        return {
+            "status": "empty",
+            "rows": 0,
+            "real_rows": 0,
+            "synthetic_rows": 0,
+            "source_mode": "NONE",
+            "note": "No stored candles",
+        }
+
+    if "source_mode" not in all_df.columns:
+        real_df = pd.DataFrame()
+        synthetic_rows = 0
+        unknown_rows = len(all_df)
     else:
-        gap_pct = 0
-    
-    source = df["source_mode"].iloc[0] if "source_mode" in df.columns and not df.empty else "unknown"
+        modes = all_df["source_mode"].astype(str)
+        real_mask = modes.isin(["LIVE_EXCHANGE", "HISTORICAL_EXCHANGE"])
+        synthetic_rows = int(modes.eq("SYNTHETIC_DEMO").sum())
+        unknown_rows = int((~real_mask & ~modes.eq("SYNTHETIC_DEMO")).sum())
+        real_df = all_df.loc[real_mask].copy()
+
+    if real_df.empty:
+        status = "demo_only" if synthetic_rows else "unknown_provenance"
+        return {
+            "status": status,
+            "rows": 0,
+            "real_rows": 0,
+            "synthetic_rows": synthetic_rows,
+            "unknown_rows": unknown_rows,
+            "first": None,
+            "last": None,
+            "age_hours": None,
+            "gap_pct": None,
+            "market": market_type,
+            "source_mode": "SYNTHETIC_DEMO" if synthetic_rows else "UNKNOWN",
+            "note": "No verified exchange candles; demo data is excluded from real-data quality.",
+        }
+
+    real_df["timestamp"] = pd.to_datetime(real_df["timestamp"], utc=True, errors="coerce")
+    real_df = real_df.dropna(subset=["timestamp"]).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    now = datetime.now(timezone.utc)
+    first = real_df["timestamp"].min().to_pydatetime()
+    last = real_df["timestamp"].max().to_pydatetime()
+    age_hours = max(0.0, (now - last).total_seconds() / 3600)
+
+    expected = {"1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
+                "15m": pd.Timedelta(minutes=15), "30m": pd.Timedelta(minutes=30),
+                "1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4),
+                "1d": pd.Timedelta(days=1), "7d": pd.Timedelta(days=7)}.get(interval)
+    if expected and len(real_df) > 1:
+        expected_rows = int((last - first) / expected) + 1
+        missing_rows = max(0, expected_rows - int(real_df["timestamp"].nunique()))
+        gap_pct = 100.0 * missing_rows / max(1, expected_rows)
+    else:
+        gap_pct = 0.0 if len(real_df) else None
+
+    modes = set(real_df["source_mode"].astype(str).unique()) if "source_mode" in real_df.columns else {"UNKNOWN"}
+    providers = sorted(set(real_df["provider"].astype(str).unique())) if "provider" in real_df.columns else ["unknown"]
+    freshness_limit = 3.5 if interval in ("1m", "5m", "15m", "30m", "1h", "4h") else 30.0
+    if age_hours > freshness_limit:
+        status = "stale"
+    elif gap_pct is not None and gap_pct > 5:
+        status = "gaps"
+    else:
+        status = "ok"
+
+    source_label = next(iter(modes)) if len(modes) == 1 else "REAL_EXCHANGE_MIXED"
     return {
-        "status": "ok" if age_hours < 3 else "stale",
-        "rows": len(df),
-        "first": str(df["timestamp"].min()),
-        "last": str(last),
-        "age_hours": round(age_hours, 1),
-        "gap_pct": round(gap_pct, 2),
+        "status": status,
+        "rows": int(len(real_df)),
+        "real_rows": int(len(real_df)),
+        "synthetic_rows": synthetic_rows,
+        "unknown_rows": unknown_rows,
+        "first": first.isoformat(),
+        "last": last.isoformat(),
+        "age_hours": round(age_hours, 2),
+        "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,
         "market": market_type,
-        "source_mode": source,
+        "source_mode": source_label,
+        "providers": providers,
+        "note": "Real exchange observations only; synthetic rows excluded.",
     }
-
-
 
 def reconcile_gaps():
     """Reconcile gaps in stored data by backfilling missing intervals."""
