@@ -223,14 +223,37 @@ def load_kaggle_source() -> tuple[dict, dict[str, pd.DataFrame]]:
             status.update(status="skipped", reason="Dataset license is not in the pipeline's explicit permissive-license allowlist; no files were downloaded or used.")
             return status, {}
         KAGGLE_DIR.mkdir(parents=True, exist_ok=True)
+        # Clear old downloaded files first; otherwise removed/renamed files from an
+        # earlier dataset version can silently contaminate today's parsed input.
+        for stale_path in sorted(KAGGLE_DIR.rglob("*"), reverse=True):
+            if stale_path.is_file():
+                stale_path.unlink()
+            elif stale_path.is_dir():
+                try:
+                    stale_path.rmdir()
+                except OSError:
+                    pass
         api.dataset_download_files(KAGGLE_REF, path=str(KAGGLE_DIR), unzip=True, quiet=True)
         frames = parse_compatible_kaggle_csvs(KAGGLE_DIR)
         rows = sum(len(frame) for frame in frames.values())
+        latest_candle = max((frame["timestamp"].max() for frame in frames.values() if not frame.empty), default=None)
+        candle_age_days = ((utc_now() - pd.Timestamp(latest_candle).to_pydatetime()).total_seconds() / 86400) if latest_candle is not None else None
+        data_freshness = "fresh" if candle_age_days is not None and 0 <= candle_age_days <= KAGGLE_STALE_DAYS else ("stale" if candle_age_days is not None else "unknown")
+        status["dataset_metadata_freshness"] = status.get("freshness", "unknown")
+        status["latest_candle_timestamp"] = iso(latest_candle)
+        status["latest_candle_age_days"] = round(max(0, candle_age_days), 2) if candle_age_days is not None else None
+        status["data_freshness"] = data_freshness
+        # The UI's main Kaggle freshness label is based on actual rows, not just
+        # metadata being edited recently. Old rows may still extend old history,
+        # but are never treated as current prices.
+        status["freshness"] = data_freshness
         status["rows_used"] = rows
         status["used_for_training"] = rows > 0
         status["status"] = "loaded" if rows else "skipped"
         if not rows:
             status["reason"] = "No exact-symbol hourly USDT OHLCV files matched the supported schema; not mixing daily, USD, or ambiguous candles."
+        elif data_freshness == "stale":
+            status["reason"] = f"Dataset candle rows end {status['latest_candle_timestamp']} ({status['latest_candle_age_days']} days old). Compatible rows may extend historical coverage only; current prices come from the live public API."
         return status, frames
     except Exception as exc:
         status.update(status="error", reason=f"{type(exc).__name__}: {str(exc)[:260]}")
