@@ -33,7 +33,7 @@ def _real_universe() -> pd.DataFrame:
     universe = load_universe()
     if universe.empty or "exchange" not in universe.columns:
         return pd.DataFrame()
-    real = universe[universe["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    real = universe[universe["exchange"].astype(str).str.lower().isin(["binance", "kraken", "coindcx"])].copy()
     if "universe_provenance" in real.columns:
         real = real[real["universe_provenance"].astype(str).isin(REAL_MODES)]
     if "status" in real.columns:
@@ -60,7 +60,7 @@ def _main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     providers = {
         name: test_provider_connectivity(name)
-        for name in ("binance", "kraken")
+        for name in ("binance", "kraken", "coindcx")
     }
     result["stages"]["provider_connectivity"] = providers
     reachable = [name for name, info in providers.items() if info.get("reachable")]
@@ -74,7 +74,9 @@ def _main() -> int:
     # Refresh the universe from official exchange metadata. If discovery fails,
     # retain an existing real universe but never promote the synthetic fixture list.
     try:
-        build_universe(UNIVERSE_SIZE, preferred_exchange=("binance" if providers.get("binance", {}).get("reachable") else "kraken"))
+        preferred_exchange = next((name for name in ("binance", "kraken", "coindcx")
+                                   if providers.get(name, {}).get("reachable")), "binance")
+        build_universe(UNIVERSE_SIZE, preferred_exchange=preferred_exchange)
     except Exception as exc:
         log.warning("Universe refresh failed: %s", exc)
     universe = _real_universe()
