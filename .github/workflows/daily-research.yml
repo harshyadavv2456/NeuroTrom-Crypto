@@ -45,6 +45,11 @@ jobs:
       - name: Install runtime and test dependencies
         run: uv sync --no-install-project --group dev
 
+      - name: Validate cloud pipeline before collecting data
+        run: |
+          uv run --no-sync python -m compileall -q scripts/cloud_pipeline.py
+          uv run --no-sync pytest -q tests/test_cloud_pipeline.py
+
       - name: Install Kaggle CLI only when an input dataset is configured
         env:
           KAGGLE_INPUT_DATASET: ${{ vars.KAGGLE_INPUT_DATASET }}
