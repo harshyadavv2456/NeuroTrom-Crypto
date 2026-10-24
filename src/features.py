@@ -148,21 +148,36 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
         if h_bars < len(f):
             f[f"label_{h_name}"] = lc.shift(-h_bars) - lc
     
-    # BTC regime feature
+    # BTC regime feature: resolve the actual exchange-listed BTC instrument
+    # (e.g. BTCUSD on Kraken versus BTCUSDT on Binance) without quote substitution.
     try:
-        btc = _load_real_candles("BTCUSDT", interval, market_type)
+        from universe import load_universe
+        active_universe = load_universe()
+        btc_rows = active_universe[
+            active_universe.get("base_asset", pd.Series(dtype=str)).astype(str).str.upper().replace({"XBT": "BTC"}) == "BTC"
+        ] if not active_universe.empty and "base_asset" in active_universe.columns else pd.DataFrame()
+        btc_symbol = str(btc_rows.iloc[0]["symbol"]) if not btc_rows.empty else "BTCUSDT"
+        btc = _load_real_candles(btc_symbol, interval, market_type)
         if btc.empty and not require_real:
-            btc = get_candles("BTCUSDT", interval, market_type, source_mode=SOURCE_SYNTHETIC)
+            btc = get_candles(btc_symbol, interval, market_type, source_mode=SOURCE_SYNTHETIC)
         if not btc.empty:
-            btc = btc.sort_values("timestamp").reset_index(drop=True)
+            btc = btc.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+            btc["timestamp"] = pd.to_datetime(btc["timestamp"], utc=True, errors="coerce")
             btc_lc = np.log(btc["close"].astype("float64"))
-            btc_ret_24 = btc_lc.diff(24)
-            merged = pd.merge(f, pd.DataFrame({"timestamp": df["timestamp"], "btc_ret_24": btc_ret_24.values}), on="timestamp", how="left")
-            f["btc_ret_24"] = merged["btc_ret_24"].values
+            btc_features = pd.DataFrame({
+                "timestamp": btc["timestamp"],
+                "btc_ret_1": btc_lc.diff(1),
+                "btc_ret_24": btc_lc.diff(24),
+            })
+            aligned = pd.merge(
+                pd.DataFrame({"timestamp": pd.to_datetime(f["timestamp"], utc=True), "asset_ret_1": r1.to_numpy()}),
+                btc_features, on="timestamp", how="left",
+            )
+            f["btc_ret_24"] = aligned["btc_ret_24"].to_numpy()
             if len(f) > 60:
-                f["beta_btc_60"] = r1.rolling(60).corr(btc_lc.diff().reindex(f.index, method="nearest"))
-    except Exception:
-        pass
+                f["beta_btc_60"] = aligned["asset_ret_1"].rolling(60).corr(aligned["btc_ret_1"])
+    except Exception as exc:
+        log.debug("BTC regime feature unavailable for %s: %s", symbol, exc)
     
     # Drop rows with insufficient history
     f = f.dropna(subset=["ret_1", "ret_20"]).reset_index(drop=True)
