@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -100,8 +101,45 @@ def rest_klines(symbol: str, interval: str, start_ms: Optional[int] = None, end_
     return df
 
 
+def _append_quarantine_frame(frame: pd.DataFrame, path: Path, time_col: str) -> None:
+    """Preserve demo/legacy rows away from the production market store."""
+    if frame.empty:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    piece = frame.copy()
+    if time_col in piece.columns:
+        piece[time_col] = pd.to_datetime(piece[time_col], utc=True, errors="coerce")
+    if path.exists():
+        try:
+            old = pd.read_parquet(path)
+            if time_col in old.columns:
+                old[time_col] = pd.to_datetime(old[time_col], utc=True, errors="coerce")
+            piece = pd.concat([old, piece], ignore_index=True)
+        except Exception as exc:
+            log.warning("Could not append existing quarantine file %s: %s", path, exc)
+    if time_col in piece.columns:
+        piece = piece.drop_duplicates(subset=[time_col], keep="last").sort_values(time_col)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    piece.to_parquet(tmp, index=False, engine="pyarrow")
+    tmp.replace(path)
+
+
 def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str = "spot", source_mode: str = SOURCE_HISTORICAL, provider: str = "binance"):
-    """Append candles to Parquet, deduplicating on (symbol, interval, open_time)."""
+    """Atomically persist real candles to production and demo candles to isolated storage."""
+    lock_root = (SYNTHETIC / "raw" / "market") if source_mode == SOURCE_SYNTHETIC else RAW
+    lock_dir = lock_root / market_type / symbol
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f".{interval}.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return _save_candles_unlocked(df, symbol, interval, market_type, source_mode, provider)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _save_candles_unlocked(df: pd.DataFrame, symbol: str, interval: str, market_type: str = "spot", source_mode: str = SOURCE_HISTORICAL, provider: str = "binance"):
+    """Write a single provenance class under the matching storage root."""
     if df.empty:
         return 0
 
@@ -110,6 +148,15 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
         df = df.rename(columns={"time": "open_time"})
     if "open_time" not in df.columns:
         raise ValueError("Cannot save candles without open_time/timestamp provenance")
+
+    modes = set(df["source_mode"].dropna().astype(str).unique()) if "source_mode" in df.columns else set()
+    allowed_modes = {SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC}
+    if len(modes) != 1 or not modes.issubset(allowed_modes):
+        raise ValueError(f"Refusing candle batch with ambiguous or mixed provenance: {sorted(modes)}")
+    mode = next(iter(modes))
+    is_demo = mode == SOURCE_SYNTHETIC
+    raw_root = SYNTHETIC / "raw" / "market" if is_demo else RAW
+    norm_root = SYNTHETIC / "market" if is_demo else MARKET
 
     # Reject invalid incoming bars before deduplication so a bad real row cannot
     # delete a previously stored valid row at the same timestamp.
@@ -129,7 +176,7 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
     if df.empty:
         return 0
 
-    raw_dir = RAW / market_type / symbol
+    raw_dir = raw_root / market_type / symbol
     raw_dir.mkdir(parents=True, exist_ok=True)
     raw_path = raw_dir / f"{interval}.parquet"
     
@@ -142,7 +189,18 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
         except Exception as e:
             log.warning("Could not read existing parquet %s: %s", raw_path, e)
             existing = pd.DataFrame()
-    
+
+    # Older builds wrote demo rows into the production path. Move unverified rows
+    # into the isolated synthetic/legacy archive as soon as a real batch touches
+    # the series. This also prevents later writes from resurrecting demo candles.
+    if not is_demo and not existing.empty:
+        real_mode_mask = existing.get("source_mode", pd.Series(index=existing.index, dtype=str)).astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])
+        non_real = existing.loc[~real_mode_mask].copy()
+        if not non_real.empty:
+            target = (SYNTHETIC / "raw" / "market" / market_type / symbol / f"{interval}.parquet")
+            _append_quarantine_frame(non_real, target, "open_time")
+            existing = existing.loc[real_mode_mask].copy()
+
     existing_before = existing.copy()
     combined = _dedupe_candles(pd.concat([existing, df], ignore_index=True), "open_time")
 
@@ -174,9 +232,11 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
         if item["open_time"] not in old_priorities or item["_priority"] > old_priorities[item["open_time"]]
     )
     
-    combined.to_parquet(raw_path, index=False, engine="pyarrow")
-    
-    norm_dir = MARKET / market_type / symbol
+    tmp_raw = raw_path.with_suffix(".parquet.tmp")
+    combined.to_parquet(tmp_raw, index=False, engine="pyarrow")
+    tmp_raw.replace(raw_path)
+
+    norm_dir = norm_root / market_type / symbol
     norm_dir.mkdir(parents=True, exist_ok=True)
     norm_path = norm_dir / f"{interval}.parquet"
     
@@ -186,10 +246,19 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
         try:
             old = pd.read_parquet(norm_path)
             old["timestamp"] = pd.to_datetime(old["timestamp"], utc=True)
+            if not is_demo:
+                real_mask = old.get("source_mode", pd.Series(index=old.index, dtype=str)).astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])
+                non_real = old.loc[~real_mask].copy()
+                if not non_real.empty:
+                    target = SYNTHETIC / "market" / market_type / symbol / f"{interval}.parquet"
+                    _append_quarantine_frame(non_real, target, "timestamp")
+                    old = old.loc[real_mask].copy()
             norm_df = _dedupe_candles(pd.concat([old, norm_df], ignore_index=True), "timestamp")
         except Exception:
             pass
-    norm_df.to_parquet(norm_path, index=False, engine="pyarrow")
+    tmp_norm = norm_path.with_suffix(".parquet.tmp")
+    norm_df.to_parquet(tmp_norm, index=False, engine="pyarrow")
+    tmp_norm.replace(norm_path)
     
     return written
 
@@ -201,16 +270,21 @@ def _utc_timestamp(value) -> pd.Timestamp:
 
 
 def get_candles(symbol: str, interval: str, market_type: str = "spot", start: Optional[datetime] = None, end: Optional[datetime] = None, source_mode: Optional[str] = None) -> pd.DataFrame:
-    """Read stored candles from normalized market dir. Optionally filter by source_mode."""
-    path = MARKET / market_type / symbol / f"{interval}.parquet"
+    """Read production exchange candles by default; demo candles require an explicit source mode."""
+    if source_mode is not None and source_mode not in {SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC}:
+        return pd.DataFrame()
+    path_root = SYNTHETIC / "market" if source_mode == SOURCE_SYNTHETIC else MARKET
+    path = path_root / market_type / symbol / f"{interval}.parquet"
     if not path.exists():
         return pd.DataFrame()
     df = pd.read_parquet(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    if source_mode is not None:
-        # A provenance-filtered read must never return unprovenanced legacy rows.
-        if "source_mode" not in df.columns:
-            return pd.DataFrame()
+    if "source_mode" not in df.columns:
+        return pd.DataFrame()
+    if source_mode is None:
+        # Default callers, including APIs, must only see exchange-derived data.
+        df = df[df["source_mode"].isin([SOURCE_LIVE, SOURCE_HISTORICAL])]
+    else:
         df = df[df["source_mode"] == source_mode]
     if start:
         df = df[df["timestamp"] >= _utc_timestamp(start)]
