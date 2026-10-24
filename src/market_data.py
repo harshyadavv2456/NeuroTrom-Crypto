@@ -33,9 +33,6 @@ BINANCE_SPOT_REST_HOSTS = (
     "https://api.binance.com",
     "https://api-gcp.binance.com",
     "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
     "https://data-api.binance.vision",
 )
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
@@ -64,7 +61,9 @@ def _binance_get(path: str, params: dict | None = None, timeout: float = 15,
     errors = []
     for host in hosts:
         try:
-            return http_get(f"{host}{path}", params=params, timeout=timeout)
+            # Bound total failover latency so a blocked primary host cannot
+            # consume the entire collector cycle before another provider is tried.
+            return http_get(f"{host}{path}", params=params, timeout=min(float(timeout), 2.5))
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
                 requests.exceptions.SSLError) as exc:
             errors.append(f"{host}: {type(exc).__name__}: {str(exc)[:180]}")
@@ -805,7 +804,7 @@ def test_provider_connectivity(provider: str = "binance") -> dict:
         for host in BINANCE_SPOT_REST_HOSTS:
             try:
                 t0 = time.monotonic()
-                r = http_get(f"{host}/api/v3/ping", timeout=5)
+                r = http_get(f"{host}/api/v3/ping", timeout=2)
                 return {
                     "provider": "binance",
                     "reachable": r.status_code == 200,
