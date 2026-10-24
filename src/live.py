@@ -304,12 +304,21 @@ class LiveCollector:
                             f"{candidate_provider}: {type(provider_exc).__name__}: {str(provider_exc)[:160]}"
                         )
                         providers.setdefault(candidate_provider, {})
-                        providers[candidate_provider].update({
-                            "provider": candidate_provider,
-                            "reachable": False,
-                            "last_error": f"{type(provider_exc).__name__}: {str(provider_exc)[:160]}",
-                            "observed_by": "ticker_request_failure",
-                        })
+                        if isinstance(provider_exc, ValueError):
+                            # The endpoint may be reachable even when this exact
+                            # instrument is not listed on that exchange.
+                            providers[candidate_provider].update({
+                                "provider": candidate_provider,
+                                "last_pair_error": str(provider_exc)[:180],
+                                "observed_by": "ticker_pair_resolution",
+                            })
+                        else:
+                            providers[candidate_provider].update({
+                                "provider": candidate_provider,
+                                "reachable": False,
+                                "last_error": f"{type(provider_exc).__name__}: {str(provider_exc)[:160]}",
+                                "observed_by": "ticker_transport_failure",
+                            })
                         continue
                 if ticker is None:
                     raise requests.exceptions.ConnectionError("No public provider returned ticker: " + " | ".join(provider_errors))
