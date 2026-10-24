@@ -419,50 +419,61 @@ async def _ws_listen(streams: list[str], callback: Callable[[dict], Awaitable[No
 # ---- Public API ----
 
 def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binance") -> dict:
-    """Fetch 24h ticker stats."""
+    """Fetch 24-hour ticker metadata from the named provider or first approved reachable provider."""
+    if provider == "auto":
+        errors = []
+        for candidate in ("binance", "kraken"):
+            try:
+                return fetch_ticker(symbol, market_type, candidate)
+            except Exception as exc:
+                errors.append(f"{candidate}: {exc}")
+        raise RuntimeError("No ticker provider available: " + "; ".join(errors))
+
     if provider == "binance":
         base = BINANCE_REST if market_type == "spot" else BINANCE_FUTURES_REST
         url = f"{base}/api/v3/ticker/24hr" if market_type == "spot" else f"{base}/fapi/v1/ticker/24hr"
-        r = http_get(url, params={"symbol": symbol}, timeout=3)
-        r.raise_for_status()
-        d = r.json()
+        response = http_get(url, params={"symbol": symbol}, timeout=5)
+        data = response.json()
         return {
-            "symbol": d["symbol"],
-            "price": float(d["lastPrice"]),
-            "change_pct": float(d["priceChangePercent"]),
-            "volume": float(d["volume"]),
-            "high": float(d["highPrice"]),
-            "low": float(d["lowPrice"]),
+            "symbol": data["symbol"],
+            "price": float(data["lastPrice"]),
+            "change_pct": float(data["priceChangePercent"]),
+            "volume": float(data["volume"]),
+            "high": float(data["highPrice"]),
+            "low": float(data["lowPrice"]),
             "provider": "binance",
             "source_mode": SOURCE_LIVE,
             "timestamp": _now_iso(),
+            "transport": response.headers.get("X-NeuroTrom-Transport", "requests"),
         }
-    elif provider == "kraken":
-        url = f"{KRAKEN_REST}/Ticker"
-        r = http_get(url, params={"pair": resolve_kraken_pair(symbol)}, timeout=3)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("error"):
-            raise ValueError(f"Kraken error: {data['error']}")
-        result = data.get("result", {})
-        pair_key = [k for k in result.keys() if k != "last"]
+
+    if provider == "kraken":
+        if market_type != "spot":
+            raise ValueError("Kraken adapter in this release supports spot market data only")
+        exact_pair = resolve_kraken_pair(symbol)
+        response = http_get(f"{KRAKEN_REST}/Ticker", params={"pair": exact_pair}, timeout=8)
+        payload = response.json()
+        if payload.get("error"):
+            raise ValueError(f"Kraken error: {payload['error']}")
+        result = payload.get("result", {})
+        pair_key = [key for key in result if key != "last"]
         if not pair_key:
-            raise ValueError("No Kraken ticker data")
-        d = result[pair_key[0]]
+            raise ValueError(f"No Kraken ticker result for {symbol}")
+        data = result[pair_key[0]]
         return {
             "symbol": symbol,
-            "price": float(d["c"][0]),
-            "change_pct": 0.0,
-            "volume": float(d["v"][1]),
-            "high": float(d["h"][1]),
-            "low": float(d["l"][1]),
+            "price": float(data["c"][0]),
+            "change_pct": None,  # Kraken's "o" is not guaranteed to be a rolling 24h open.
+            "volume": float(data["v"][1]),
+            "high": float(data["h"][1]),
+            "low": float(data["l"][1]),
             "provider": "kraken",
             "source_mode": SOURCE_LIVE,
             "timestamp": _now_iso(),
+            "transport": response.headers.get("X-NeuroTrom-Transport", "requests"),
         }
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
 
+    raise ValueError(f"Unknown provider: {provider}")
 
 def test_provider_connectivity(provider: str = "binance") -> dict:
     """Test connectivity to a provider."""
