@@ -139,7 +139,7 @@ def _refresh_universe_if_needed(provider_status: dict) -> pd.DataFrame:
     must_refresh = current_real.empty or not current_exchanges.intersection(reachable)
     if reachable and must_refresh:
         try:
-            refreshed = build_universe(UNIVERSE_SIZE)
+            refreshed = build_universe(UNIVERSE_SIZE, preferred_exchange=("binance" if providers.get("binance", {}).get("reachable") else "kraken"))
             refreshed_real = _real_universe(refreshed)
             if not refreshed_real.empty:
                 log.info("Refreshed real universe: %d symbols from %s",
