@@ -84,9 +84,12 @@ button,select{font:inherit;cursor:pointer}a{color:var(--blue);text-decoration:no
   }
   function renderSources(){
     var k=latest&&latest.kaggle||{},host=latest&&latest.provider||{},passed=(host.host_checks||[]).find(function(x){return x.reachable;});
-    var items=[["Market feed",host.name||"Unavailable"],["Provider host",passed&&passed.host||"No host passed"],["Fresh symbols",(host.fresh_symbols||[]).length+" / 5"],["Kaggle input",k.dataset_ref||"Not configured"],["Kaggle freshness",k.freshness||k.status||"Not configured"],["Kaggle last update",k.last_updated?new Date(k.last_updated).toLocaleString():"—"],["Kaggle history rows",Number(k.rows_used||0).toLocaleString()],["Data warnings",(latest&&latest.errors||[]).length],["Git commit",String(latest&&latest.run&&latest.run.commit||"—").slice(0,8)]];
+    var requested=(host.requested_symbols||latest&&latest.limits&&latest.limits.symbols_requested||[]);
+    var tickerCount=(host.ticker_symbols||[]).length;
+    var candleCount=(host.fresh_symbols||[]).length;
+    var items=[["Market feed",host.name||"Unavailable"],["Provider host",passed&&passed.host||"No host passed"],["Current tickers",tickerCount+" / "+requested.length],["Fresh hourly series",candleCount+" / "+requested.length],["Kaggle input",k.dataset_ref||"Not configured"],["Kaggle data age",k.latest_candle_age_days!=null?k.latest_candle_age_days+" days": "—"],["Kaggle metadata updated",k.last_updated?new Date(k.last_updated).toLocaleString():"—"],["Kaggle row status",k.freshness||k.status||"Not configured"],["Kaggle rows loaded",Number(k.rows_used||0).toLocaleString()],["Data warnings",(latest&&latest.errors||[]).length],["Git commit",String(latest&&latest.run&&latest.run.commit||"—").slice(0,8)]];
     $("source-grid").innerHTML=items.map(function(v){return '<div class="source-label">'+esc(v[0])+'</div><div class="source-value">'+esc(v[1])+'</div>';}).join("");
-    $("symbol-count").textContent=(host.fresh_symbols||[]).length+" / "+Number(latest&&latest.limits&&latest.limits.symbols_requested&&latest.limits.symbols_requested.length||5);
+    $("symbol-count").textContent=tickerCount+" / "+requested.length;
   }
   function renderChart(){
     var symbol=$("asset-select").value||"BTCUSDT",points=historyData&&historyData.series&&historyData.series[symbol]||[],chosen=points.slice(-range),wrap=$("chart");
