@@ -63,7 +63,7 @@ def backfill_universe(intervals: list[str] = None, universe_limit: int = 60, day
         for _, record in target_records:
             sym = str(record["symbol"])
             provider = str(record.get("exchange", "binance")).lower()
-            if provider not in {"binance", "kraken"}:
+            if provider not in {"binance", "kraken", "coindcx"}:
                 errors.append(f"{sym}: skipped; universe provenance is demo/unknown")
                 continue
 
