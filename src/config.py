@@ -19,6 +19,8 @@ MAX_LIVE_CONCURRENCY = 8
 
 # Model settings
 HORIZONS = ("1h", "4h", "24h", "7d")
+# Crypto trades 24/7: use calendar-hour bars, not equity-session assumptions.
+HORIZON_BARS = {"1h": 1, "4h": 4, "24h": 24, "7d": 168}
 BASE_PARAMS = dict(
     learning_rate=0.025,
     num_leaves=31,
