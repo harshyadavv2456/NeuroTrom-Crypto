@@ -17,9 +17,45 @@ REAL_MODES = {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"}
 MAX_INPUT_AGE_HOURS = 2.5
 
 
+def _real_models_ready() -> tuple[bool, list[str]]:
+    missing = []
+    for horizon in HORIZONS:
+        model_path = MODELS / f"crypto_{horizon}.txt"
+        provenance_path = MODELS / f"crypto_{horizon}_provenance.json"
+        try:
+            meta = json.loads(provenance_path.read_text()) if provenance_path.is_file() else {}
+        except (OSError, ValueError):
+            meta = {}
+        mode = str(meta.get("provenance", "UNKNOWN"))
+        if not model_path.is_file() or mode not in REAL_MODES:
+            missing.append(f"{horizon}:{mode}")
+    return not missing, missing
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     now = datetime.now(timezone.utc)
+
+    # The hourly job is also the recovery loop. If this is a fresh install or a
+    # provider has just recovered, bootstrap real ingestion/training first.
+    models_ready, missing_models = _real_models_ready()
+    if not models_ready:
+        log.info("Real models missing (%s); attempting guarded real-data bootstrap", missing_models)
+        from bootstrap_real import main as bootstrap_real_main
+        bootstrap_rc = bootstrap_real_main()
+        models_ready, missing_models = _real_models_ready()
+        if bootstrap_rc != 0 or not models_ready:
+            reason = f"bootstrap exit={bootstrap_rc}; real models still missing={missing_models}"
+            recovery_report = {
+                "started_at": now.isoformat(),
+                "status": "blocked",
+                "reason": reason,
+                "missing_models": missing_models,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_report(recovery_report)
+            print(json.dumps(recovery_report, indent=2))
+            return int(bootstrap_rc or 5)
     report = {
         "started_at": now.isoformat(),
         "status": "blocked",
