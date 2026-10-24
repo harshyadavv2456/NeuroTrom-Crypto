@@ -129,7 +129,12 @@ def status():
     if not df.empty and "symbol" in df.columns:
         for symbol in df["symbol"].astype(str).tolist():
             for interval in ("1h", "1d"):
+                # Default reads are production-only. Count historical demo archives
+                # separately so the dashboard can show demo data without implying
+                # that it has contaminated the production candle store.
                 stored = get_candles(symbol, interval, "spot")
+                demo = get_candles(symbol, interval, "spot", source_mode=SOURCE_SYNTHETIC)
+                synthetic_rows += len(demo)
                 if stored.empty:
                     continue
                 if "source_mode" not in stored.columns:
@@ -137,10 +142,8 @@ def status():
                     continue
                 modes = stored["source_mode"].astype(str)
                 real_mask = modes.isin([SOURCE_HISTORICAL, SOURCE_LIVE])
-                synth_mask = modes.eq(SOURCE_SYNTHETIC)
+                unknown_rows += int((~real_mask).sum())
                 real_rows += int(real_mask.sum())
-                synthetic_rows += int(synth_mask.sum())
-                unknown_rows += int((~real_mask & ~synth_mask).sum())
                 if real_mask.any():
                     real_data_available = True
                     newest = pd.to_datetime(stored.loc[real_mask, "timestamp"], utc=True).max()
@@ -149,6 +152,7 @@ def status():
 
     synthetic_only = synthetic_rows > 0 and real_rows == 0
     synthetic_data_present = synthetic_rows > 0
+    active_synthetic_rows = 0  # get_candles() defaults to the production-only store
     # Models
     model_provenances = []
     for h in HORIZONS:
@@ -199,6 +203,8 @@ def status():
         "real_data_available": real_data_available,
         "real_rows": real_rows,
         "synthetic_rows": synthetic_rows,
+        "synthetic_archive_rows": synthetic_rows,
+        "active_synthetic_rows": active_synthetic_rows,
         "unknown_provenance_rows": unknown_rows,
         "synthetic_only": synthetic_only,
         "synthetic_data_present": synthetic_data_present,
