@@ -56,10 +56,10 @@ jobs:
           if [[ ( -n "$KAGGLE_INPUT_DATASET" || -n "$KAGGLE_OUTPUT_DATASET" ) && ( -n "$KAGGLE_API_TOKEN" || ( -n "$KAGGLE_USERNAME" && -n "$KAGGLE_KEY" ) ) ]]; then
             uv pip install --python .venv/bin/python kaggle
             echo "Kaggle input configured; source freshness and license will be checked by the pipeline."
-          elif [[ -n "$KAGGLE_INPUT_DATASET" ]]; then
-            echo "::warning::KAGGLE_INPUT_DATASET is set but Kaggle credentials are missing. The pipeline will continue with live public data."
+          elif [[ -n "$KAGGLE_INPUT_DATASET" || -n "$KAGGLE_OUTPUT_DATASET" ]]; then
+            echo "::warning::A Kaggle dataset is configured but Kaggle credentials are missing. The pipeline will continue with public API data; the optional Kaggle output will not work."
           else
-            echo "No Kaggle input dataset configured; the live public API remains the primary source."
+            echo "No Kaggle datasets configured; the live public API remains the primary source."
           fi
 
       - name: Run cloud ingest, model training, evaluation and forecast
@@ -83,6 +83,18 @@ jobs:
           fi
           # Always publish the current status report, even when data/model quality is degraded.
           exit 0
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload static dashboard artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy dashboard
+        id: deployment
+        uses: actions/deploy-pages@v4
 
       - name: Publish optional daily snapshot to an existing Kaggle output dataset
         if: vars.KAGGLE_OUTPUT_PUBLISH == 'true' && vars.KAGGLE_OUTPUT_DATASET != ''
@@ -121,18 +133,6 @@ jobs:
           PY
           cp site/data/daily_update.csv "$tmp/daily_update.csv"
           kaggle datasets version -p "$tmp" -m "Automated market snapshot ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:8})" -q -t -r skip
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload static dashboard artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
-
-      - name: Deploy dashboard
-        id: deployment
-        uses: actions/deploy-pages@v4
 
       - name: Fail the run when market data or all models are not ready
         if: steps.pipeline.outputs.exit_code != '0'
