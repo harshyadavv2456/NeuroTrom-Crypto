@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,39 @@ def _provider_status(refresh: bool = False) -> dict:
     }
     _PROVIDER_CACHE_AT = time.monotonic()
     return _PROVIDER_CACHE
+
+def _resolve_exchange_symbol(symbol: str) -> tuple[str, str] | None:
+    """Map an asset request to an exact real exchange instrument from the active universe.
+
+    This can switch BTCUSDT to BTCUSD only by returning the true exchange symbol and
+    provider explicitly; it never labels USD prices as USDT prices.
+    """
+    requested = str(symbol).upper().replace("/", "").replace("-", "")
+    base = requested
+    for quote in ("USDT", "USDC", "USD", "EUR", "GBP"):
+        if requested.endswith(quote) and len(requested) > len(quote):
+            base = requested[:-len(quote)]
+            break
+    if base == "XBT":
+        base = "BTC"
+    universe_df = load_universe()
+    if universe_df.empty or "symbol" not in universe_df.columns:
+        return None
+    if "exchange" not in universe_df.columns:
+        return None
+    real = universe_df[universe_df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    if real.empty:
+        return None
+    if "base_asset" in real.columns:
+        matches = real[real["base_asset"].astype(str).str.upper().replace({"XBT": "BTC"}) == base]
+    else:
+        matches = real[real["symbol"].astype(str).str.upper().str.startswith(base)]
+    if matches.empty:
+        return None
+    exact = matches[matches["symbol"].astype(str).str.upper() == requested]
+    chosen = (exact if not exact.empty else matches).iloc[0]
+    return str(chosen["symbol"]), str(chosen["exchange"]).lower()
+
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 if UI_DIR.exists() and (UI_DIR / "index.html").exists():
@@ -114,6 +148,7 @@ def status():
                         latest_real_timestamp = newest
 
     synthetic_only = synthetic_rows > 0 and real_rows == 0
+    synthetic_data_present = synthetic_rows > 0
     # Models
     model_provenances = []
     for h in HORIZONS:
@@ -163,6 +198,7 @@ def status():
         "synthetic_rows": synthetic_rows,
         "unknown_provenance_rows": unknown_rows,
         "synthetic_only": synthetic_only,
+        "synthetic_data_present": synthetic_data_present,
         "any_provider": any_provider,
         "providers": providers,
         "models_ready": real_models >= len(HORIZONS),
@@ -191,10 +227,22 @@ def universe():
 @app.get("/v1/crypto/market")
 def market(symbol: str = "BTCUSDT", provider: str = "auto"):
     try:
-        t = fetch_ticker(symbol, "spot", provider)
-        return _clean(t)
+        try:
+            t = fetch_ticker(symbol, "spot", provider)
+            return _clean(t)
+        except Exception as first_error:
+            if provider != "auto":
+                raise first_error
+            resolved = _resolve_exchange_symbol(symbol)
+            if not resolved:
+                raise RuntimeError(f"No real exchange instrument found for {symbol}; refresh the real universe first") from first_error
+            actual_symbol, actual_provider = resolved
+            t = fetch_ticker(actual_symbol, "spot", actual_provider)
+            t["requested_symbol"] = symbol
+            t["symbol_resolution_note"] = f"Using actual exchange instrument {actual_symbol} on {actual_provider}; quote currency may differ."
+            return _clean(t)
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(503, str(e))
 
 
 @app.get("/v1/crypto/candles")
@@ -203,6 +251,7 @@ def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200,
     if source_mode == SOURCE_SYNTHETIC and not allow_synthetic:
         raise HTTPException(400, "Synthetic candles require allow_synthetic=true and are demo-only")
 
+    actual_symbol = symbol
     if source_mode:
         df = get_candles(symbol, interval, "spot", source_mode=source_mode)
     else:
@@ -212,6 +261,16 @@ def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200,
         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if not df.empty:
             df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+        else:
+            resolved = _resolve_exchange_symbol(symbol)
+            if resolved:
+                actual_symbol, chosen_provider = resolved
+                frames = [get_candles(actual_symbol, interval, "spot", source_mode=mode)
+                          for mode in (SOURCE_HISTORICAL, SOURCE_LIVE)]
+                frames = [frame for frame in frames if not frame.empty]
+                df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                if not df.empty:
+                    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
 
     if df.empty and source_mode in (None, SOURCE_HISTORICAL):
         try:
@@ -235,8 +294,10 @@ def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200,
     if df.empty:
         raise HTTPException(503, f"No verified exchange candles available for {symbol} {interval}; synthetic data is not served by default")
 
-    df = df.tail(max(1, min(limit, 2000)))
-    fields = [col for col in ("timestamp", "open", "high", "low", "close", "volume", "source_mode", "provider") if col in df.columns]
+    df = df.tail(max(1, min(limit, 2000))).copy()
+    df["requested_symbol"] = symbol
+    df["symbol"] = actual_symbol
+    fields = [col for col in ("timestamp", "symbol", "requested_symbol", "open", "high", "low", "close", "volume", "source_mode", "provider") if col in df.columns]
     return _clean(df[fields].to_dict(orient="records"))
 
 
