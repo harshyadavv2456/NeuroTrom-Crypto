@@ -111,6 +111,10 @@ jobs:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           set -euo pipefail
+          if ! command -v kaggle >/dev/null 2>&1 || { [[ -z "$KAGGLE_API_TOKEN" ]] && { [[ -z "$KAGGLE_USERNAME" ]] || [[ -z "$KAGGLE_KEY" ]]; }; }; then
+            echo "::warning::Kaggle output is enabled but CLI/authentication is unavailable; the GitHub Pages CSV remains published and the Kaggle version was skipped."
+            exit 0
+          fi
           if [[ "$KAGGLE_OUTPUT_DATASET" == "$KAGGLE_INPUT_DATASET" && -n "$KAGGLE_INPUT_DATASET" ]]; then
             echo "::error::KAGGLE_OUTPUT_DATASET must be separate from the historical input dataset to avoid overwriting source data."
             exit 1
