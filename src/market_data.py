@@ -111,6 +111,24 @@ def save_candles(df: pd.DataFrame, symbol: str, interval: str, market_type: str 
     if "open_time" not in df.columns:
         raise ValueError("Cannot save candles without open_time/timestamp provenance")
 
+    # Reject invalid incoming bars before deduplication so a bad real row cannot
+    # delete a previously stored valid row at the same timestamp.
+    for column in ("open", "high", "low", "close", "volume"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    invalid_input = (
+        df[list(("open", "high", "low", "close", "volume"))].isna().any(axis=1)
+        | (df["open"] <= 0) | (df["high"] <= 0) | (df["low"] <= 0) | (df["close"] <= 0)
+        | (df["volume"] < 0)
+        | (df["high"] < df["low"])
+        | (df["high"] < df["open"]) | (df["high"] < df["close"])
+        | (df["low"] > df["open"]) | (df["low"] > df["close"])
+    )
+    if invalid_input.any():
+        log.warning("Dropping %d invalid incoming OHLC rows for %s %s", int(invalid_input.sum()), symbol, interval)
+        df = df.loc[~invalid_input].copy()
+    if df.empty:
+        return 0
+
     raw_dir = RAW / market_type / symbol
     raw_dir.mkdir(parents=True, exist_ok=True)
     raw_path = raw_dir / f"{interval}.parquet"
