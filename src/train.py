@@ -131,6 +131,11 @@ def train_model(df: pd.DataFrame, horizon: str, params: dict = None,
                           "timestamp_ic_count": len(per_time_ic)})
 
     finite_ics = [ic for ic in fold_ics if np.isfinite(ic)]
+    if len(finite_ics) < 2:
+        raise ValueError(
+            f"Not promoting {horizon}: only {len(finite_ics)} valid walk-forward IC folds; "
+            "need at least 2 chronologically separated validation folds"
+        )
     final_model = lgb.train(params, lgb.Dataset(df_v[feats], label=df_v[label_col]), num_boost_round=ROUNDS)
 
     metrics = {
