@@ -42,6 +42,11 @@ BINANCE_FUTURES_REST = "https://fapi.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 KRAKEN_REST = "https://api.kraken.com/0/public"
+COINDCX_REST = "https://api.coindcx.com"
+_COINDCX_MARKETS_CACHE: list[dict] | None = None
+_COINDCX_MARKETS_CACHE_AT = 0.0
+_COINDCX_TICKERS_CACHE: dict[str, dict] = {}
+_COINDCX_TICKERS_CACHE_AT = 0.0
 
 
 def _binance_get(path: str, params: dict | None = None, timeout: float = 15,
@@ -433,6 +438,101 @@ def kraken_ohlc(pair: str, interval: int = 60, since: Optional[int] = None,
     df["source_mode"] = source_mode
     df["provider"] = "kraken"
     return df
+
+
+# ---- CoinDCX public spot market data (no account credentials required) ----
+
+def coindcx_market_details(refresh: bool = False) -> list[dict]:
+    """Fetch active CoinDCX public market metadata; never uses account credentials."""
+    global _COINDCX_MARKETS_CACHE, _COINDCX_MARKETS_CACHE_AT
+    if not refresh and _COINDCX_MARKETS_CACHE is not None and time.time() - _COINDCX_MARKETS_CACHE_AT < 900:
+        return _COINDCX_MARKETS_CACHE
+    response = http_get(f"{COINDCX_REST}/exchange/v1/markets_details", timeout=12)
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("Unexpected CoinDCX markets-details response")
+    _COINDCX_MARKETS_CACHE = [item for item in payload if isinstance(item, dict)]
+    _COINDCX_MARKETS_CACHE_AT = time.time()
+    return _COINDCX_MARKETS_CACHE
+
+
+def resolve_coindcx_pair(symbol: str) -> str:
+    """Resolve canonical symbol like BTCUSDT to an active exact CoinDCX pair."""
+    wanted = str(symbol).upper().replace("/", "").replace("-", "")
+    for item in coindcx_market_details():
+        if str(item.get("status", "active")).lower() != "active":
+            continue
+        candidate = str(item.get("symbol") or item.get("coindcx_name") or "").upper().replace("/", "").replace("-", "")
+        if candidate == wanted and item.get("pair"):
+            return str(item["pair"])
+    raise ValueError(f"CoinDCX has no active exact market for {symbol}")
+
+
+def discover_coindcx_universe(quote_asset: str = "USDT", limit: int = 200) -> pd.DataFrame:
+    """Discover active CoinDCX spot pairs via unauthenticated public market metadata."""
+    rows = []
+    for item in coindcx_market_details():
+        if str(item.get("status", "")).lower() != "active":
+            continue
+        base = str(item.get("target_currency_short_name", "")).upper()
+        quote = str(item.get("base_currency_short_name", "")).upper()
+        symbol = str(item.get("symbol") or item.get("coindcx_name") or "").upper()
+        pair = str(item.get("pair", ""))
+        if not base or not quote or quote != quote_asset.upper() or not pair:
+            continue
+        if symbol != f"{base}{quote}":
+            continue
+        rows.append({
+            "symbol": symbol, "base_asset": base, "quote_asset": quote,
+            "status": "TRADING", "contract_type": "SPOT", "exchange": "coindcx",
+            "market": "spot", "exchange_pair": pair,
+            "universe_source": "COINDCX_MARKETS_DETAILS",
+            "universe_provenance": SOURCE_HISTORICAL, "priority": 0,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["symbol"]).sort_values(["priority", "base_asset"]).head(limit).reset_index(drop=True)
+    return df
+
+
+def coindcx_ohlc(symbol: str, interval: str = "1h",
+                  start_ms: int | None = None, end_ms: int | None = None,
+                  limit: int = 1000, source_mode: str = SOURCE_HISTORICAL) -> pd.DataFrame:
+    """Fetch completed CoinDCX spot candles using its public, unauthenticated endpoint."""
+    if interval not in {"1m", "15m", "1h", "1d"}:
+        raise ValueError(f"Unsupported CoinDCX interval: {interval}")
+    pair = resolve_coindcx_pair(symbol)
+    params = {"pair": pair, "interval": interval, "limit": min(max(int(limit), 1), 1000)}
+    if start_ms is not None:
+        params["startTime"] = int(start_ms)
+    if end_ms is not None:
+        params["endTime"] = int(end_ms)
+    response = http_get(f"{COINDCX_REST}/market_data/candles", params=params, timeout=15)
+    raw = response.json()
+    if not isinstance(raw, list) or not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw)
+    required = {"time", "open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        raise ValueError("Unexpected CoinDCX candle schema")
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["time"], errors="coerce"), unit="ms", utc=True)
+    duration = {"1m": pd.Timedelta(minutes=1), "15m": pd.Timedelta(minutes=15),
+                "1h": pd.Timedelta(hours=1), "1d": pd.Timedelta(days=1)}[interval]
+    df["close_time"] = df["open_time"] + duration
+    df = df.dropna(subset=["open_time", "open", "high", "low", "close", "volume"])
+    df = df[df["close_time"] <= pd.Timestamp.now(tz="UTC")].copy()
+    if df.empty:
+        return df
+    df["symbol"] = str(symbol).upper().replace("/", "").replace("-", "")
+    df["interval"] = interval
+    df["market"] = "spot"
+    df["exchange"] = "coindcx"
+    df["ingested_at"] = _now_iso()
+    df["source_mode"] = source_mode
+    df["provider"] = "coindcx"
+    return df.sort_values("open_time").reset_index(drop=True)
 
 
 # ---- Backfill ----
