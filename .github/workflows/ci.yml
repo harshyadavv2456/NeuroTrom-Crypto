@@ -1,0 +1,29 @@
+name: NeuroTrom Crypto CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked project dependencies without installing the app package
+        run: uv sync --no-install-project --group dev
+      - name: Syntax-check Python sources
+        run: uv run --no-sync python -m compileall -q src
+      - name: Run tests
+        env:
+          PYTHONPATH: src
+        run: uv run --no-sync pytest -q tests
