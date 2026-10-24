@@ -145,7 +145,11 @@ def _refresh_universe_if_needed(provider_status: dict) -> pd.DataFrame:
     must_refresh = current_real.empty or not current_exchanges.intersection(reachable)
     if reachable and must_refresh:
         try:
-            preferred_exchange = "binance" if provider_status.get("binance", {}).get("reachable") else "kraken"
+            preferred_exchange = next(
+                (name for name in ("binance", "kraken", "coindcx")
+                 if provider_status.get(name, {}).get("reachable")),
+                "binance",
+            )
             refreshed = build_universe(UNIVERSE_SIZE, preferred_exchange=preferred_exchange)
             refreshed_real = _real_universe(refreshed)
             if not refreshed_real.empty:
@@ -162,7 +166,8 @@ def _refresh_universe_if_needed(provider_status: dict) -> pd.DataFrame:
         # provider request can attempt its own transport/host fallback.
         if not reachable:
             return current_real.reset_index(drop=True)
-        return current_real[current_real["exchange"].astype(str).str.lower().isin(reachable)].reset_index(drop=True)
+        reachable_subset = current_real[current_real["exchange"].astype(str).str.lower().isin(reachable)].reset_index(drop=True)
+        return reachable_subset if not reachable_subset.empty else current_real.reset_index(drop=True)
     return pd.DataFrame()
 
 
