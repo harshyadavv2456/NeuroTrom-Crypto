@@ -413,8 +413,14 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
             }
             continue
         cutoff_index = int(len(times) * 0.8)
+        if cutoff_index <= bars + 1 or cutoff_index >= len(times):
+            model_report["models"][horizon] = {"status": "insufficient_data", "rows": int(len(eligible))}
+            continue
         cutoff = times[cutoff_index]
-        train = eligible[eligible["timestamp"] < cutoff]
+        # Embargo the entire forecast horizon from training so the final train
+        # labels cannot observe any future close inside the holdout window.
+        train_end = times[cutoff_index - bars]
+        train = eligible[eligible["timestamp"] < train_end]
         test = eligible[eligible["timestamp"] >= cutoff]
         if len(train) < 300 or len(test) < 100:
             model_report["models"][horizon] = {"status": "insufficient_data", "rows": int(len(eligible))}
@@ -422,7 +428,7 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
         params = {
             "objective": "regression", "n_estimators": 220, "learning_rate": 0.03,
             "num_leaves": 15, "max_depth": -1, "min_child_samples": 80,
-            "subsample": 0.8, "colsample_bytree": 0.75, "reg_lambda": 3.0,
+            "subsample": 0.8, "subsample_freq": 1, "colsample_bytree": 0.75, "reg_lambda": 3.0,
             "random_state": 42, "verbosity": -1, "n_jobs": 2,
         }
         try:
@@ -438,7 +444,9 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
             model_report["models"][horizon] = {
                 "status": "trained", "provenance": "BINANCE_PUBLIC_REST",
                 "training_rows": int(len(eligible)), "validation_rows": int(len(test)),
-                "validation_cutoff": iso(cutoff), "holdout_spearman_ic": round(float(ic), 5) if np.isfinite(ic) else None,
+                "validation_cutoff": iso(cutoff), "training_end_exclusive": iso(train_end),
+                "embargo_hours": bars,
+                "holdout_spearman_ic": round(float(ic), 5) if np.isfinite(ic) else None,
                 "holdout_mae_return": round(mae, 6), "directional_accuracy": round(directional, 4),
                 "n_estimators": params["n_estimators"],
                 "metric_note": "Time-ordered holdout metrics; not proof of profitability or future performance.",
