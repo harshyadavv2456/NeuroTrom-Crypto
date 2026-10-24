@@ -35,3 +35,7 @@ neurotrom-crypto = "neurotrom_crypto.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
