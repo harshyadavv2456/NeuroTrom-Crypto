@@ -1,175 +1,211 @@
-"""End-to-end verification with source-aware checks."""
+"""Non-destructive end-to-end verification of the real-data crypto pipeline.
+
+This test never launches synthetic training, overwrites production models, performs
+backfills, or fabricates predictions. It reports the real source/runtime state and
+exits nonzero unless the end-to-end production path is actually ready.
+"""
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
-import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
 import pandas as pd
+import requests
 
-from config import DATA, HOST, PORT, SOURCE_SYNTHETIC
-from market_data import test_provider_connectivity
+from config import DATA, HOST, PORT, HORIZONS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
+from market_data import get_candles, test_provider_connectivity
 from features import build_feature_dataset
-from train import _check_provenance, MODELS
-from journal import PREDICTIONS
+from train import MODELS, _check_provenance, train_model
+from journal import compute_journal_summary
+from live import get_live_status
 from universe import load_universe
 
 log = logging.getLogger(__name__)
 RESULTS = []
 REPORTS_DIR = DATA / "reports"
+REAL_MODES = {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"}
 
 
 def check(layer: str, name: str, fn):
-    t0 = time.time()
+    started = time.monotonic()
     try:
-        ok, detail = fn()
-    except Exception as e:
-        ok, detail = False, f"{type(e).__name__}: {e}"
-    elapsed = time.time() - t0
-    RESULTS.append((layer, name, "PASS" if ok else "FAIL", str(detail)[:200], round(elapsed, 1)))
-    print(f"{'PASS' if ok else 'FAIL'} [{layer}] {name} - {str(detail)[:120]}", flush=True)
+        result = fn()
+        ok, detail = result if isinstance(result, tuple) else (True, str(result))
+    except Exception as exc:
+        ok, detail = False, f"{type(exc).__name__}: {str(exc)[:250]}"
+    RESULTS.append({
+        "layer": layer, "name": name, "status": "PASS" if ok else "FAIL",
+        "detail": str(detail)[:500], "seconds": round(time.monotonic() - started, 2),
+    })
+    print(f"{'PASS' if ok else 'FAIL'} [{layer}] {name} — {str(detail)[:180]}", flush=True)
+    return bool(ok)
+
+
+def _real_universe() -> pd.DataFrame:
+    df = load_universe()
+    if df.empty or "exchange" not in df.columns:
+        return pd.DataFrame()
+    real = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    if "universe_provenance" in real.columns:
+        real = real[real["universe_provenance"].astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])]
+    if "status" in real.columns:
+        real = real[~real["status"].astype(str).str.upper().isin(["DEMO_ONLY", "SYNTHETIC"])]
+    return real.reset_index(drop=True)
+
+
+def _real_candle_counts(universe: pd.DataFrame) -> dict:
+    real_rows = 0
+    synthetic_rows = 0
+    unknown_rows = 0
+    real_series = 0
+    latest = None
+    for symbol in universe["symbol"].astype(str).tolist():
+        for interval in ("1h", "1d"):
+            df = get_candles(symbol, interval, "spot")
+            if df.empty:
+                continue
+            if "source_mode" not in df.columns:
+                unknown_rows += len(df)
+                continue
+            modes = df["source_mode"].astype(str)
+            real_mask = modes.isin([SOURCE_LIVE, SOURCE_HISTORICAL])
+            synthetic_rows += int(modes.eq(SOURCE_SYNTHETIC).sum())
+            unknown_rows += int((~real_mask & ~modes.eq(SOURCE_SYNTHETIC)).sum())
+            real_rows += int(real_mask.sum())
+            if real_mask.any():
+                real_series += 1
+                stamp = pd.to_datetime(df.loc[real_mask, "timestamp"], utc=True).max()
+                if pd.notna(stamp) and (latest is None or stamp > latest):
+                    latest = stamp
+    return {
+        "real_rows": real_rows,
+        "synthetic_rows": synthetic_rows,
+        "unknown_rows": unknown_rows,
+        "real_series": real_series,
+        "series_expected": int(len(universe) * 2),
+        "latest_real_candle": str(latest) if latest is not None else None,
+    }
 
 
 def main() -> int:
-    # 1. Provider connectivity — must be reported accurately even when unreachable
-    def check_binance():
-        r = test_provider_connectivity("binance")
-        ok = "provider" in r and "reachable" in r
-        return ok, f"reachable={r.get('reachable')}, reported correctly"
-    check("data", "binance_connectivity_reported", check_binance)
-    
-    def check_kraken():
-        r = test_provider_connectivity("kraken")
-        ok = "provider" in r and "reachable" in r
-        return ok, f"reachable={r.get('reachable')}, reported correctly"
-    check("data", "kraken_connectivity_reported", check_kraken)
-    
-    # 2. Universe
-    def universe_check():
-        df = load_universe()
-        return len(df) >= 30, f"{len(df)} symbols"
-    check("data", "universe_loaded", universe_check)
-    
-    # 3. System correctly reports real data status
-    def real_data_check():
-        from market_data import get_candles
-        from config import SOURCE_HISTORICAL, SOURCE_LIVE
-        df = load_universe()
-        if df.empty:
-            return False, "no universe"
-        sym = df["symbol"].iloc[0]
-        real = get_candles(sym, "1h", "spot", source_mode=SOURCE_HISTORICAL)
-        live = get_candles(sym, "1h", "spot", source_mode=SOURCE_LIVE)
-        has_real = not real.empty or not live.empty
-        
-        # Verify API status matches reality
-        import requests
-        from config import HOST, PORT
-        r = requests.get(f"http://{HOST}:{PORT}/v1/crypto/status", timeout=30)
-        data = r.json()
-        reported_real = data.get("real_data_available", False)
-        reported_synthetic = data.get("synthetic_only", False)
-        
-        if not has_real and not reported_real and reported_synthetic:
-            return True, "correctly reports: no real data, synthetic-only"
-        elif has_real and reported_real:
-            return True, "real data present and reported"
-        else:
-            return False, f"mismatch: has_real={has_real}, reported_real={reported_real}, synthetic_only={reported_synthetic}"
-    check("data", "real_data_status_accurate", real_data_check)
-    
-    # 4. Features reject synthetic-only when required
-    def features_reject_synthetic():
-        from features import build_feature_dataset
-        df = build_feature_dataset(require_real=True)
-        if df.empty:
-            return True, "correctly rejected synthetic-only data"
-        return False, "should have rejected synthetic-only data"
-    check("data", "features_reject_synthetic", features_reject_synthetic)
-    
-    # 5. Training refuses synthetic-only by default
-    def training_rejects_synthetic():
-        from train import run_training
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    started = datetime.now(timezone.utc).isoformat()
+
+    def provider_check(provider: str):
+        result = test_provider_connectivity(provider)
+        return ("provider" in result and isinstance(result.get("reachable"), bool),
+                f"reachable={result.get('reachable')}; transport={result.get('transport', 'requests/curl')}; error={result.get('error', '')}")
+    check("sources", "binance_connectivity_reported", lambda: provider_check("binance"))
+    check("sources", "kraken_connectivity_reported", lambda: provider_check("kraken"))
+
+    universe = _real_universe()
+    check("universe", "real_exchange_universe_loaded", (len(universe) > 0, f"{len(universe)} real instruments"))
+    data = _real_candle_counts(universe) if not universe.empty else {
+        "real_rows": 0, "synthetic_rows": 0, "unknown_rows": 0, "real_series": 0,
+        "series_expected": 0, "latest_real_candle": None,
+    }
+    check("data", "real_exchange_candles_persisted",
+          (data["real_rows"] > 0, json.dumps(data, sort_keys=True)))
+
+    features = build_feature_dataset(interval="1h", require_real=True)
+    feature_modes = set(features["source_mode"].astype(str).unique()) if not features.empty and "source_mode" in features.columns else set()
+    features_real = bool(len(features)) and bool(feature_modes) and feature_modes.issubset({SOURCE_LIVE, SOURCE_HISTORICAL})
+    check("features", "production_features_are_exchange_only",
+          (features_real, f"rows={len(features)} symbols={features['symbol'].nunique() if not features.empty else 0} provenance={sorted(feature_modes)}"))
+
+    # Exercise the synthetic rejection before any fit begins. The test data is
+    # in-memory only and must not be persisted to the production feature store.
+    def synthetic_training_guard():
+        fake = pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=200, freq="h", tz="UTC"),
+            "symbol": ["TESTCOIN"] * 200,
+            "source_mode": [SOURCE_SYNTHETIC] * 200,
+            "provider": ["synthetic"] * 200,
+            "feature_a": range(200),
+            "label_24h": [0.01] * 200,
+        })
         try:
-            run_training(allow_synthetic=False)
-            return False, "should have refused synthetic-only training"
-        except (ValueError, RuntimeError) as e:
-            if "synthetic" in str(e).lower() or "no feature data" in str(e).lower():
-                return True, f"correctly rejected: {e}"
-            return False, f"wrong error: {e}"
-    check("research", "training_rejects_synthetic", training_rejects_synthetic)
-    
-    # 6. Training accepts explicit flag (for research)
-    def training_allows_synthetic_explicit():
-        from train import run_training
+            train_model(fake, "24h", allow_synthetic=False)
+        except ValueError as exc:
+            return "synthetic" in str(exc).lower() or "provenance" in str(exc).lower(), str(exc)
+        return False, "training accepted synthetic-only fixture without explicit opt-in"
+    check("safety", "production_training_rejects_synthetic", synthetic_training_guard)
+
+    model_rows = []
+    for horizon in HORIZONS:
+        model_file = MODELS / f"crypto_{horizon}.txt"
+        provenance_file = MODELS / f"crypto_{horizon}_provenance.json"
         try:
-            report = run_training(allow_synthetic=True)
-            return "horizons" in report, "training with explicit synthetic flag"
-        except Exception as e:
-            return False, str(e)
-    check("research", "training_explicit_synthetic", training_allows_synthetic_explicit)
-    
-    # 7. Model provenance
-    def model_provenance():
-        import os
-        files = list(MODELS.glob("crypto_*_provenance.json"))
-        if not files:
-            return False, "no provenance files"
-        for f in files:
-            data = json.loads(f.read_text())
-            if data.get("provenance") == SOURCE_SYNTHETIC:
-                return True, f"models labeled synthetic: {f.name}"
-        return True, f"{len(files)} provenance files"
-    check("research", "model_provenance", model_provenance)
-    
-    # 8. API health
-    def api_health():
-        r = requests.get(f"http://{HOST}:{PORT}/health", timeout=5)
-        return r.status_code == 200, f"HTTP {r.status_code}"
-    check("api", "health_endpoint", api_health)
-    
-    # 9. API status shows accurate overall
-    def api_status_accurate():
-        r = requests.get(f"http://{HOST}:{PORT}/v1/crypto/status", timeout=60)
-        data = r.json()
-        overall = data.get("overall", "")
-        ok = "DEGRADED" in overall or "BLOCKED" in overall or "OK" in overall
-        return ok, f"overall={overall}"
-    check("api", "status_accurate", api_status_accurate)
-    
-    # 10. Dashboard
-    def dashboard_check():
-        r = requests.get(f"http://{HOST}:{PORT}/", timeout=5)
-        return r.status_code == 200 and "NeuroTrom" in r.text, f"HTTP {r.status_code}"
-    check("api", "dashboard", dashboard_check)
-    
-    # 11. No synthetic in production prediction endpoint
-    def no_synthetic_predictions():
-        r = requests.get(f"http://{HOST}:{PORT}/v1/crypto/predictions", timeout=5)
-        data = r.json()
-        preds = data.get("predictions", [])
-        synthetic = [p for p in preds if p.get("source_mode") == SOURCE_SYNTHETIC]
-        return len(synthetic) == 0, f"{len(synthetic)} synthetic predictions in production feed"
-    check("api", "no_synthetic_predictions", no_synthetic_predictions)
-    
-    # Write report
-    report_path = REPORTS_DIR / "e2e_report.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"# E2E Report {datetime.now(timezone.utc):%Y-%m-%d %H:%M}", ""]
-    for layer, name, status, detail, elapsed in RESULTS:
-        lines.append(f"- [{status}] [{layer}] {name} ({elapsed}s): {detail}")
-    passed = sum(1 for r in RESULTS if r[2] == "PASS")
-    lines.append(f"\nResult: {'PASS' if passed == len(RESULTS) else 'FAIL'} ({passed}/{len(RESULTS)})")
-    report_path.write_text("\n".join(lines))
-    
-    return 0 if passed == len(RESULTS) else 1
+            meta = json.loads(provenance_file.read_text()) if provenance_file.is_file() else {}
+        except (OSError, ValueError):
+            meta = {}
+        provenance = meta.get("provenance", "UNKNOWN")
+        model_rows.append({
+            "horizon": horizon,
+            "file_exists": model_file.is_file(),
+            "provenance": provenance,
+            "real_ready": model_file.is_file() and provenance in REAL_MODES,
+        })
+    models_real = all(row["real_ready"] for row in model_rows)
+    check("models", "all_horizons_have_real_models", (models_real, json.dumps(model_rows, sort_keys=True)))
+
+    journal = compute_journal_summary()
+    real_predictions = int(journal.get("real_predictions", 0))
+    check("journal", "forward_real_predictions_recorded",
+          (real_predictions > 0, f"real={real_predictions}; synthetic={journal.get('synthetic_predictions', 0)}; matured_real={journal.get('matured', 0)}"))
+
+    live = get_live_status()
+    live_fresh = bool(live.get("fresh")) and bool(live.get("streams"))
+    check("collector", "live_market_observations_fresh",
+          (live_fresh, f"running={live.get('collector_running')}; fresh={live.get('fresh')}; last={live.get('last_update')}; streams={len(live.get('streams') or [])}; errors={len(live.get('errors') or [])}"))
+
+    api_payload = {}
+    api_ok = False
+    try:
+        response = requests.get(f"http://{HOST}:{PORT}/v1/crypto/status", timeout=15)
+        response.raise_for_status()
+        api_payload = response.json()
+        actual_has_real = data["real_rows"] > 0
+        api_ok = bool(api_payload.get("api_live")) and bool(api_payload.get("real_data_available")) == actual_has_real
+        api_detail = f"overall={api_payload.get('overall')}; reported_real={api_payload.get('real_data_available')}; persisted_real={actual_has_real}"
+    except Exception as exc:
+        api_detail = f"{type(exc).__name__}: {exc}"
+    check("api", "status_matches_persisted_data", (api_ok, api_detail))
+
+    overall_ready = api_payload.get("overall") == "OK" and data["real_rows"] > 0 and models_real and real_predictions > 0 and live_fresh
+    overall = "OK" if overall_ready and all(x["status"] == "PASS" for x in RESULTS) else str(api_payload.get("overall") or "BLOCKED — API status unavailable")
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    report = [
+        "# NeuroTrom Crypto End-to-End Report",
+        "",
+        f"- Started: {started}",
+        f"- Finished: {datetime.now(timezone.utc).isoformat()}",
+        f"- Overall: **{overall}**",
+        f"- Real exchange universe: {len(universe)} instruments",
+        f"- Real candle rows: {data['real_rows']}",
+        f"- Synthetic rows in active universe files: {data['synthetic_rows']}",
+        f"- Unknown-provenance rows: {data['unknown_rows']}",
+        f"- Real forward predictions: {real_predictions}",
+        "",
+        "| Layer | Check | Status | Detail |",
+        "|---|---|---|---|",
+    ]
+    for item in RESULTS:
+        detail = item["detail"].replace("|", "\\|").replace("\n", " ")
+        report.append(f"| {item['layer']} | {item['name']} | {item['status']} | {detail} |")
+    report.extend(["", "This report does not train models or write forecasts. It only inspects runtime state and uses an in-memory synthetic fixture to test the training guard."])
+    (REPORTS_DIR / "e2e_report.md").write_text("\n".join(report) + "\n")
+
+    passed = sum(item["status"] == "PASS" for item in RESULTS)
+    failed = len(RESULTS) - passed
+    print(f"\nE2E result: {passed}/{len(RESULTS)} checks passed; overall={overall}; report={REPORTS_DIR / 'e2e_report.md'}")
+    return 0 if failed == 0 and overall_ready else 1
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    sys.exit(main())
+    raise SystemExit(main())
