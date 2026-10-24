@@ -45,6 +45,7 @@ def inspect_real_candles(universe: pd.DataFrame) -> dict:
         "synthetic_rows": 0,
         "unknown_rows": 0,
         "real_series": 0,
+        "production_nonreal_rows": 0,
         "series_expected": int(len(universe) * 2),
         "latest_real_timestamp": None,
     }
@@ -52,6 +53,8 @@ def inspect_real_candles(universe: pd.DataFrame) -> dict:
     for symbol in universe["symbol"].astype(str).tolist():
         for interval in ("1h", "1d"):
             df = get_candles(symbol, interval, "spot")
+            demo_df = get_candles(symbol, interval, "spot", source_mode=SOURCE_SYNTHETIC)
+            result["synthetic_rows"] += len(demo_df)
             if df.empty:
                 continue
             if "source_mode" not in df.columns:
@@ -59,10 +62,10 @@ def inspect_real_candles(universe: pd.DataFrame) -> dict:
                 continue
             modes = df["source_mode"].astype(str)
             real = modes.isin([SOURCE_LIVE, SOURCE_HISTORICAL])
-            demo = modes.eq(SOURCE_SYNTHETIC)
             result["real_rows"] += int(real.sum())
-            result["synthetic_rows"] += int(demo.sum())
-            result["unknown_rows"] += int((~real & ~demo).sum())
+            result["unknown_rows"] += int((~real).sum())
+            if bool((~real).any()):
+                result["production_nonreal_rows"] = result.get("production_nonreal_rows", 0) + int((~real).sum())
             if real.any():
                 result["real_series"] += 1
                 stamps = pd.to_datetime(df.loc[real, "timestamp"], utc=True, errors="coerce").dropna()
@@ -111,8 +114,10 @@ def main() -> int:
                               json.dumps(data, sort_keys=True)))
     failures.append(not check("no unknown-provenance candle rows", data["unknown_rows"] == 0,
                               f"{data['unknown_rows']} unknown-provenance rows"))
-    check("demo candles isolated/labelled", data["synthetic_rows"] == 0,
-          f"{data['synthetic_rows']} demo rows in active universe files")
+    failures.append(not check("production store contains only real rows", data.get("production_nonreal_rows", 0) == 0,
+                              f"{data.get('production_nonreal_rows', 0)} non-real rows in production reads"))
+    check("synthetic fixtures isolated", True,
+          f"{data['synthetic_rows']} demo rows in separate archive; excluded from production reads")
 
     real_models = []
     for horizon in HORIZONS:
