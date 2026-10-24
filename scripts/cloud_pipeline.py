@@ -250,8 +250,9 @@ def load_kaggle_source() -> tuple[dict, dict[str, pd.DataFrame]]:
         # metadata being edited recently. Old rows may still extend old history,
         # but are never treated as current prices.
         status["freshness"] = data_freshness
-        status["rows_used"] = rows
-        status["used_for_training"] = rows > 0
+        status["rows_compatible"] = rows
+        status["rows_used"] = 0
+        status["used_for_training"] = False
         status["status"] = "loaded" if rows else "skipped"
         if not rows:
             status["reason"] = "No exact-symbol hourly USDT OHLCV files matched the supported schema; not mixing daily, USD, or ambiguous candles."
@@ -690,7 +691,7 @@ def main() -> int:
                     old["source"] = old["source"].astype(str)
                     api_frame = pd.concat([old, api_frame], ignore_index=True)
                     api_frame = api_frame.drop_duplicates("timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
-                    kaggle_status["rows_used"] = int(len(old))
+                    kaggle_status["rows_used"] = int(kaggle_status.get("rows_used", 0)) + int(len(old))
                     kaggle_status["used_for_training"] = True
             data[symbol] = api_frame
             LOG.info("%s: %d hourly bars, last=%s", symbol, len(api_frame), api_frame["timestamp"].max())
@@ -699,6 +700,12 @@ def main() -> int:
             if symbol in kaggle_frames and not kaggle_frames[symbol].empty:
                 data[symbol] = kaggle_frames[symbol].copy()
                 errors.append(f"{symbol}: using compatible historical Kaggle candles only; they are not current API data.")
+    if kaggle_frames and not kaggle_status.get("used_for_training"):
+        prior_reason = kaggle_status.get("reason")
+        kaggle_status["reason"] = (
+            "Compatible Kaggle rows were found, but none extend the history before the live API window; no Kaggle rows were used."
+            + (f" Previous note: {prior_reason}" if prior_reason else "")
+        )
     models, predictions = train_models(data, tickers)
     journal, journal_summary = update_journal(previous_journal, predictions, data)
     publish_outputs(tickers, data, models, predictions, kaggle_status, host_checks, errors, journal, journal_summary)
