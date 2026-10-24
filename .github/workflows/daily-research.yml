@@ -114,6 +114,18 @@ jobs:
             echo "::error::No daily_update.csv was generated; will not publish an empty Kaggle version."
             exit 1
           fi
+          python - <<'PY'
+          import csv, json
+          from pathlib import Path
+          report = json.loads(Path("site/data/latest.json").read_text())
+          prices = [x for x in report.get("market", []) if x.get("symbol") and x.get("price") is not None]
+          if len({x["symbol"] for x in prices}) < 3:
+              raise SystemExit("Refusing to update Kaggle: fewer than three live ticker symbols were observed.")
+          with Path("site/data/daily_update.csv").open(newline="") as f:
+              rows = list(csv.DictReader(f))
+          if not rows or not any(r.get("price") for r in rows):
+              raise SystemExit("Refusing to update Kaggle with an empty/unpriced daily CSV.")
+          PY
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           kaggle datasets metadata "$KAGGLE_OUTPUT_DATASET" -p "$tmp"
