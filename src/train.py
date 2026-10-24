@@ -1,4 +1,4 @@
-"""LightGBM training with walk-forward validation."""
+"""LightGBM training with walk-forward validation and provenance checks."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
-from config import DATA, HORIZONS, BASE_PARAMS, ROUNDS, N_FOLDS, GAP, COST_BPS
+from config import DATA, HORIZONS, BASE_PARAMS, ROUNDS, N_FOLDS, GAP, COST_BPS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
 from features import build_feature_dataset, load_features, save_features
 
 log = logging.getLogger(__name__)
@@ -32,20 +32,40 @@ def _labels(df: pd.DataFrame, horizon: str) -> pd.Series:
 def _feature_cols(df: pd.DataFrame) -> list[str]:
     exclude = {"timestamp", "symbol", "interval", "market", "exchange", "ingested_at", "date",
                "label_1h", "label_4h", "label_24h", "label_7d", "open_time", "close_time",
-               "open", "high", "low", "close", "volume", "quote_volume", "trades"}
+               "open", "high", "low", "close", "volume", "quote_volume", "trades",
+               "source_mode", "provider"}
     return [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
 
 
-def train_model(df: pd.DataFrame, horizon: str, params: dict = None) -> tuple[lgb.Booster, dict]:
+def _check_provenance(df: pd.DataFrame) -> str:
+    """Check dataset provenance. Returns the dominant source mode."""
+    if "source_mode" not in df.columns or df.empty:
+        return SOURCE_SYNTHETIC
+    counts = df["source_mode"].value_counts()
+    if counts.empty:
+        return SOURCE_SYNTHETIC
+    dominant = counts.index[0]
+    # If any real data exists, consider it mixed
+    if SOURCE_LIVE in counts.index or SOURCE_HISTORICAL in counts.index:
+        if dominant == SOURCE_SYNTHETIC and counts.get(SOURCE_SYNTHETIC, 0) > counts.get(SOURCE_HISTORICAL, 0) + counts.get(SOURCE_LIVE, 0):
+            return SOURCE_SYNTHETIC
+        return "MIXED" if dominant == SOURCE_SYNTHETIC else dominant
+    return SOURCE_SYNTHETIC
+
+
+def train_model(df: pd.DataFrame, horizon: str, params: dict = None, allow_synthetic: bool = False) -> tuple[Optional[lgb.Booster], dict]:
     """Train a LightGBM model with walk-forward validation."""
     if params is None:
         params = dict(BASE_PARAMS)
+    
+    provenance = _check_provenance(df)
+    if provenance == SOURCE_SYNTHETIC and not allow_synthetic:
+        raise ValueError(f"Refusing to train production model on synthetic-only data. Provenance: {provenance}")
     
     params = dict(params, objective="regression", seed=42)
     feats = _feature_cols(df)
     label = _labels(df, horizon)
     
-    # Drop rows with missing labels
     valid = label.notna()
     df_v = df[valid].copy()
     label_v = label[valid]
@@ -53,7 +73,6 @@ def train_model(df: pd.DataFrame, horizon: str, params: dict = None) -> tuple[lg
     if len(df_v) < 100:
         raise ValueError(f"Not enough data for {horizon}: {len(df_v)} rows")
     
-    # Time-based split for walk-forward
     df_v = df_v.sort_values("timestamp").reset_index(drop=True)
     n = len(df_v)
     fold_size = n // N_FOLDS
@@ -64,7 +83,6 @@ def train_model(df: pd.DataFrame, horizon: str, params: dict = None) -> tuple[lg
     
     for fold in range(N_FOLDS):
         if fold >= N_FOLDS - 1:
-            # Last fold: use as training for final model
             break
         
         train_end = fold * fold_size
@@ -91,7 +109,6 @@ def train_model(df: pd.DataFrame, horizon: str, params: dict = None) -> tuple[lg
         fold_ics.append(float(ic))
         models.append(m)
     
-    # Train final model on all data
     dtrain_all = lgb.Dataset(df_v[feats], label=label_v)
     final_model = lgb.train(params, dtrain_all, num_boost_round=ROUNDS)
     
@@ -99,52 +116,66 @@ def train_model(df: pd.DataFrame, horizon: str, params: dict = None) -> tuple[lg
         "horizon": horizon,
         "n_rows": int(len(df_v)),
         "n_features": len(feats),
-        "features": feats[:20],  # store top 20 for reporting
+        "features": feats[:20],
         "fold_ics": [round(ic, 4) for ic in fold_ics],
         "mean_fold_ic": round(float(np.mean(fold_ics)), 4) if fold_ics else None,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "params": {k: v for k, v in params.items() if k in ("learning_rate", "num_leaves", "min_data_in_leaf", "feature_fraction", "bagging_fraction", "lambda_l2", "max_bin", "extra_trees")},
+        "data_provenance": provenance,
+        "allow_synthetic": allow_synthetic,
     }
     
     return final_model, metrics
 
 
-def save_model(model: lgb.Booster, horizon: str) -> Path:
+def save_model(model: lgb.Booster, horizon: str, provenance: str = "UNKNOWN") -> Path:
     path = MODELS / f"crypto_{horizon}.txt"
     model.save_model(str(path))
+    # Save provenance alongside model
+    prov_path = MODELS / f"crypto_{horizon}_provenance.json"
+    prov_path.write_text(json.dumps({
+        "horizon": horizon,
+        "provenance": provenance,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "model_path": str(path),
+    }, indent=2))
     return path
 
 
-def run_training(interval: str = "1h") -> dict:
-    """Run full training pipeline."""
-    log.info("Starting training pipeline on interval %s", interval)
-    df = build_feature_dataset(interval=interval)
+def run_training(interval: str = "1h", allow_synthetic: bool = False) -> dict:
+    """Run full training pipeline. Refuses to train on synthetic-only data unless allow_synthetic=True."""
+    log.info("Starting training pipeline on interval %s (allow_synthetic=%s)", interval, allow_synthetic)
+    df = build_feature_dataset(interval=interval, require_real=not allow_synthetic)
     if df.empty:
         raise RuntimeError("No feature data available for training")
     
     save_features(df, "training")
+    provenance = _check_provenance(df)
     
     results = {}
     for horizon in HORIZONS:
         if horizon == "7d" and interval != "1h":
             continue
         try:
-            model, metrics = train_model(df, horizon)
-            path = save_model(model, horizon)
-            metrics["model_path"] = str(path)
-            results[horizon] = metrics
-            log.info("Trained %s: mean IC=%s, n=%d", horizon, metrics.get("mean_fold_ic"), metrics["n_rows"])
+            model, metrics = train_model(df, horizon, allow_synthetic=allow_synthetic)
+            if model is not None:
+                path = save_model(model, horizon, provenance)
+                metrics["model_path"] = str(path)
+                results[horizon] = metrics
+                log.info("Trained %s: mean IC=%s, n=%d, provenance=%s", horizon, metrics.get("mean_fold_ic"), metrics["n_rows"], provenance)
+            else:
+                results[horizon] = {"error": "Model is None", "provenance": provenance}
         except Exception as e:
             log.error("Training failed for %s: %s", horizon, e)
-            results[horizon] = {"error": str(e)}
+            results[horizon] = {"error": str(e), "provenance": provenance}
     
-    # Save report
     report_path = REPORTS / "training_report.json"
     report = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "interval": interval,
         "n_rows": len(df),
         "symbols": df["symbol"].nunique() if "symbol" in df.columns else 0,
+        "data_provenance": provenance,
         "horizons": results,
     }
     report_path.write_text(json.dumps(report, indent=2, default=str))
@@ -154,7 +185,6 @@ def run_training(interval: str = "1h") -> dict:
 
 def predict(df: pd.DataFrame, horizon: str) -> Optional[pd.Series]:
     """Generate predictions using saved model."""
-    from market_data import get_candles
     model_path = MODELS / f"crypto_{horizon}.txt"
     if not model_path.exists():
         return None
@@ -171,6 +201,5 @@ def predict(df: pd.DataFrame, horizon: str) -> Optional[pd.Series]:
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    report = run_training()
+    report = run_training(allow_synthetic=False)
     print(json.dumps(report, indent=2, default=str))
-

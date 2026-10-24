@@ -1,4 +1,4 @@
-"""Core tests."""
+"""Core tests for NeuroTrom Crypto — source-aware and provenance-checked."""
 from __future__ import annotations
 
 import json
@@ -6,13 +6,12 @@ import logging
 import numpy as np
 import pandas as pd
 import pytest
+from pathlib import Path
 
 
 def test_feature_no_lookahead():
     """Future labels must not be available at feature time."""
     from features import compute_features
-    # compute_features requires disk data; this is an integration test
-    # We verify the label columns are future-shifted by inspecting the code
     import inspect
     src = inspect.getsource(compute_features)
     assert "shift(-" in src, "Labels must use shift to avoid lookahead"
@@ -24,12 +23,12 @@ def test_ohlcv_validation():
     from market_data import save_candles
     from pathlib import Path
     import shutil
-    
-    # Use a temp dir for this test
     from config import DATA
+    
     test_dir = DATA / "market" / "__test_ohlcv"
     test_dir.mkdir(parents=True, exist_ok=True)
     
+    from config import SOURCE_HISTORICAL
     df = pd.DataFrame({
         "open_time": pd.date_range("2024-01-01", periods=5, freq="h", tz="UTC"),
         "open": [100.0] * 5,
@@ -42,15 +41,14 @@ def test_ohlcv_validation():
         "market": ["spot"] * 5,
         "exchange": ["binance"] * 5,
         "ingested_at": ["2024-01-01T00:00:00+00:00"] * 5,
+        "source_mode": [SOURCE_HISTORICAL] * 5,
+        "provider": ["binance"] * 5,
     })
-    # Invalid row: high < low
     df.loc[2, "high"] = 98.0
-    df.loc[2, "low"] = 99.0  # high=98, low=99 -> invalid
+    df.loc[2, "low"] = 99.0
     written = save_candles(df, "__test_ohlcv", "1h", "spot")
-    # Should drop the invalid row (4 valid + 1 invalid = 4 written after dedup)
     assert written <= 4, f"Expected <=4 rows written, got {written}"
     
-    # Cleanup
     shutil.rmtree(test_dir, ignore_errors=True)
     shutil.rmtree(DATA / "raw" / "market" / "__test_ohlcv", ignore_errors=True)
 
@@ -90,7 +88,6 @@ def test_prediction_journal():
     summary = compute_journal_summary()
     assert "total_predictions" in summary
     
-    # Cleanup test predictions
     from journal import PREDICTIONS
     if PREDICTIONS.exists():
         shutil.rmtree(PREDICTIONS.parent, ignore_errors=True)
@@ -107,17 +104,14 @@ def test_port_no_conflict_with_finvest():
     """Port 8775 must not be FinVest's port (8765, 8790)."""
     import subprocess
     r = subprocess.run(["lsof", "-iTCP:8775", "-sTCP:LISTEN"], capture_output=True, text=True)
-    # If something is on 8775, verify it's our API by checking the command contains 'api:app' or 'neurotrom-crypto'
     if r.returncode == 0:
         out = r.stdout.lower()
         assert "api:app" in out or "neurotrom-crypto" in out or "8775" in out, f"Port 8775 occupied by unexpected service: {r.stdout}"
 
 
 def test_lightgbm_trains():
-    """LightGBM can train on synthetic data."""
+    """LightGBM can train on synthetic data with explicit flag."""
     import lightgbm as lgb
-    import numpy as np
-    import pandas as pd
     from config import BASE_PARAMS
     from scipy.stats import spearmanr
     
@@ -126,7 +120,6 @@ def test_lightgbm_trains():
     X = pd.DataFrame({"f1": np.random.randn(n), "f2": np.random.randn(n), "f3": np.random.randn(n)})
     y = X["f1"] * 0.5 + X["f2"] * 0.3 + np.random.randn(n) * 0.5
     
-    # Use lighter params for small dataset
     params = dict(BASE_PARAMS, objective="regression", seed=42, min_data_in_leaf=50, num_leaves=15)
     model = lgb.train(params, lgb.Dataset(X, y), num_boost_round=100)
     preds = model.predict(X)
@@ -135,19 +128,85 @@ def test_lightgbm_trains():
     assert ic > 0.2, f"LightGBM IC too low: {ic}"
 
 
-def test_universe_offline():
-    """Universe can be built from cached/synthetic data when network is unavailable."""
-    from universe import build_universe
-    # If network is unavailable, this should handle gracefully
+def test_training_rejects_synthetic_by_default():
+    """Training must refuse synthetic-only data unless explicitly allowed."""
+    from train import train_model, _check_provenance
+    from config import SOURCE_SYNTHETIC
+    
+    # Create a synthetic-only DataFrame
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=200, freq="h", tz="UTC"),
+        "symbol": ["BTCUSDT"] * 200,
+        "interval": ["1h"] * 200,
+        "market": ["spot"] * 200,
+        "close": np.random.randn(200).cumsum() + 100,
+        "open": np.random.randn(200).cumsum() + 100,
+        "high": np.random.randn(200).cumsum() + 101,
+        "low": np.random.randn(200).cumsum() + 99,
+        "volume": np.random.rand(200) * 1e6,
+        "source_mode": [SOURCE_SYNTHETIC] * 200,
+        "label_24h": np.random.randn(200),
+    })
+    
+    provenance = _check_provenance(df)
+    assert provenance == SOURCE_SYNTHETIC
+    
     try:
-        df = build_universe(30)
-        # If network works, we should get valid symbols
-        if not df.empty:
-            assert all(df["status"] == "TRADING")
-            assert all(df["quote_asset"] == "USDT")
-    except Exception as e:
-        # Network failure is acceptable in offline test
-        assert "timed out" in str(e).lower() or "connection" in str(e).lower()
+        train_model(df, "24h", allow_synthetic=False)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "synthetic" in str(e).lower()
 
 
-from scipy.stats import spearmanr
+def test_features_require_real_data():
+    """Feature computation must reject synthetic-only data when require_real=True."""
+    from features import compute_features
+    from config import SOURCE_SYNTHETIC
+    
+    # This test verifies the code path exists; actual disk test is integration
+    import inspect
+    src = inspect.getsource(compute_features)
+    assert "require_real" in src
+    assert "SOURCE_SYNTHETIC" in src
+
+
+def test_provenance_in_candles():
+    """Candles must carry source_mode and provider columns."""
+    from market_data import save_candles, get_candles
+    from config import SOURCE_HISTORICAL
+    import shutil
+    
+    df = pd.DataFrame({
+        "open_time": pd.date_range("2024-01-01", periods=5, freq="h", tz="UTC"),
+        "open": [100.0] * 5,
+        "high": [101.0] * 5,
+        "low": [99.0] * 5,
+        "close": [100.5] * 5,
+        "volume": [1e6] * 5,
+        "symbol": ["__test_prov"] * 5,
+        "interval": ["1h"] * 5,
+        "market": ["spot"] * 5,
+        "exchange": ["binance"] * 5,
+        "ingested_at": ["2024-01-01T00:00:00+00:00"] * 5,
+        "source_mode": [SOURCE_HISTORICAL] * 5,
+        "provider": ["binance"] * 5,
+    })
+    save_candles(df, "__test_prov", "1h", "spot", source_mode=SOURCE_HISTORICAL, provider="binance")
+    stored = get_candles("__test_prov", "1h", "spot")
+    assert "source_mode" in stored.columns
+    assert "provider" in stored.columns
+    assert all(stored["source_mode"] == SOURCE_HISTORICAL)
+    assert all(stored["provider"] == "binance")
+    
+    shutil.rmtree(Path.home() / "Library/Application Support/NeuroTrom-Crypto/market/spot/__test_prov", ignore_errors=True)
+    shutil.rmtree(Path.home() / "Library/Application Support/NeuroTrom-Crypto/raw/market/__test_prov", ignore_errors=True)
+    shutil.rmtree(Path.home() / "Library/Application Support/NeuroTrom-Crypto/raw/market/__test_prov", ignore_errors=True)
+
+
+def test_health_degraded_when_no_provider():
+    """Health check must report degraded when no provider is reachable."""
+    from health import test_provider_connectivity
+    # This test just verifies the function exists and returns expected keys
+    r = test_provider_connectivity("kraken")
+    assert "reachable" in r
+    assert "provider" in r

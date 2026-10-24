@@ -1,4 +1,4 @@
-"""Crypto-specific feature engineering."""
+"""Crypto-specific feature engineering with provenance tracking."""
 from __future__ import annotations
 
 import json
@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import DATA, HORIZONS
+from config import DATA, HORIZONS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
 
 log = logging.getLogger(__name__)
 FEATURES_DIR = DATA / "features"
@@ -24,10 +24,32 @@ def _rsi(c: pd.Series, n: int = 14) -> pd.Series:
     return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
 
-def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot") -> Optional[pd.DataFrame]:
-    """Compute all features for a symbol from stored OHLCV data."""
+def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot", require_real: bool = False) -> Optional[pd.DataFrame]:
+    """Compute all features for a symbol from stored OHLCV data.
+    
+    Args:
+        require_real: If True, reject datasets that contain only synthetic data.
+    """
     from market_data import get_candles
-    df = get_candles(symbol, interval, market_type)
+    
+    # Try to get real data first
+    df = get_candles(symbol, interval, market_type, source_mode=SOURCE_HISTORICAL)
+    source_mode = SOURCE_HISTORICAL
+    
+    if df.empty:
+        # Fall back to live data
+        df = get_candles(symbol, interval, market_type, source_mode=SOURCE_LIVE)
+        source_mode = SOURCE_LIVE
+    
+    if df.empty:
+        # Last resort: check if any data exists (including synthetic)
+        df = get_candles(symbol, interval, market_type)
+        source_mode = df["source_mode"].iloc[0] if "source_mode" in df.columns and not df.empty else SOURCE_SYNTHETIC
+    
+    if require_real and source_mode == SOURCE_SYNTHETIC:
+        log.warning("Rejecting synthetic data for production training: %s %s", symbol, interval)
+        return None
+    
     if df.empty or len(df) < 60:
         return None
     
@@ -43,6 +65,8 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     f["symbol"] = symbol
     f["interval"] = interval
     f["market"] = market_type
+    f["source_mode"] = source_mode
+    f["provider"] = df["provider"].iloc[0] if "provider" in df.columns else "unknown"
     f["close"] = c
     
     # Returns
@@ -99,22 +123,20 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     f["max_drawdown_20"] = c.rolling(20).apply(lambda x: (x / x.cummax() - 1).min(), raw=False)
     
     # Labels (future returns) - compute only for completed bars
-    label_horizons = {"1h": 1, "4h": 4, "24h": 20, "7d": 140}  # in bars for 1h interval
+    label_horizons = {"1h": 1, "4h": 4, "24h": 20, "7d": 140}
     for h_name, h_bars in label_horizons.items():
         if h_bars < len(f):
             f[f"label_{h_name}"] = lc.shift(-h_bars) - lc
     
-    # BTC regime feature (if BTCUSDT available)
+    # BTC regime feature
     try:
-        btc = get_candles("BTCUSDT", interval, market_type)
+        btc = get_candles("BTCUSDT", interval, market_type, source_mode=source_mode)
         if not btc.empty:
             btc = btc.sort_values("timestamp").reset_index(drop=True)
             btc_lc = np.log(btc["close"].astype("float64"))
             btc_ret_24 = btc_lc.diff(24)
-            # Align by timestamp
             merged = pd.merge(f, pd.DataFrame({"timestamp": df["timestamp"], "btc_ret_24": btc_ret_24.values}), on="timestamp", how="left")
             f["btc_ret_24"] = merged["btc_ret_24"].values
-            # Beta-like: rolling 60-bar correlation
             if len(f) > 60:
                 f["beta_btc_60"] = r1.rolling(60).corr(btc_lc.diff().reindex(f.index, method="nearest"))
     except Exception:
@@ -126,21 +148,32 @@ def compute_features(symbol: str, interval: str = "1h", market_type: str = "spot
     return f
 
 
-def build_feature_dataset(symbols: list[str] = None, interval: str = "1h", market_type: str = "spot") -> pd.DataFrame:
-    """Build a feature dataset for multiple symbols."""
+def build_feature_dataset(symbols: list[str] = None, interval: str = "1h", market_type: str = "spot", require_real: bool = False) -> pd.DataFrame:
+    """Build a feature dataset for multiple symbols.
+    
+    Args:
+        require_real: If True, reject any symbol whose data is synthetic-only.
+    """
     from universe import load_universe
     if symbols is None:
         df = load_universe()
         symbols = df["symbol"].tolist()[:60] if not df.empty else ["BTCUSDT", "ETHUSDT"]
     
     all_feats = []
+    rejected = []
     for sym in symbols:
         try:
-            feat = compute_features(sym, interval, market_type)
+            feat = compute_features(sym, interval, market_type, require_real=require_real)
             if feat is not None and not feat.empty:
                 all_feats.append(feat)
+            else:
+                rejected.append(sym)
         except Exception as e:
             log.warning("Feature error for %s: %s", sym, e)
+            rejected.append(sym)
+    
+    if rejected:
+        log.info("Rejected %d symbols (no real data): %s", len(rejected), rejected[:10])
     
     if not all_feats:
         return pd.DataFrame()
@@ -160,7 +193,7 @@ def save_features(df: pd.DataFrame, name: str = "latest"):
     """Save feature dataset to Parquet."""
     path = FEATURES_DIR / f"{name}.parquet"
     df.to_parquet(path, index=False, engine="pyarrow")
-    log.info("Saved %d rows to %s", len(df), path)
+    log.info("Saved %d rows to %s (source: %s)", len(df), path, df["source_mode"].iloc[0] if "source_mode" in df.columns and not df.empty else "unknown")
 
 
 def load_features(name: str = "latest") -> pd.DataFrame:
@@ -173,7 +206,6 @@ def load_features(name: str = "latest") -> pd.DataFrame:
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    df = build_feature_dataset(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"], "1h")
+    df = build_feature_dataset(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"], "1h", require_real=False)
     print(f"Features: {len(df)} rows, {len(df.columns)} columns")
-    print(df[["timestamp", "symbol", "ret_1", "ret_20", "rsi_14", "vol_ratio", "label_1h", "label_4h", "label_24h"]].tail(5).to_string(index=False))
-
+    print(df[["timestamp", "symbol", "ret_1", "ret_20", "rsi_14", "vol_ratio", "label_1h", "label_4h", "label_24h", "source_mode"]].tail(5).to_string(index=False))

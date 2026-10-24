@@ -1,4 +1,4 @@
-"""Synthetic data generator for offline testing when Binance is unreachable."""
+"""Synthetic data generator for offline testing when real providers are unreachable."""
 from __future__ import annotations
 
 import json
@@ -10,10 +10,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import DATA, HISTORY_INTERVALS
+from config import DATA, HISTORY_INTERVALS, SOURCE_SYNTHETIC
 from market_data import save_candles
 
 log = logging.getLogger(__name__)
+SYNTHETIC_DIR = DATA / "synthetic"
 
 
 def generate_synthetic_candles(symbol: str, interval: str = "1h", days: int = 90, market_type: str = "spot") -> pd.DataFrame:
@@ -35,14 +36,8 @@ def generate_synthetic_candles(symbol: str, interval: str = "1h", days: int = 90
         periods = days
         freq = "h"
     
-    # Generate timestamps
-    if interval == "1m":
-        # Skip non-trading minutes (crypto trades 24/7, but for realism we keep all)
-        ts = pd.date_range(end=end, periods=periods, freq=freq, tz="UTC")
-    else:
-        ts = pd.date_range(end=end, periods=periods, freq=freq, tz="UTC")
+    ts = pd.date_range(end=end, periods=periods, freq=freq, tz="UTC")
     
-    # Price dynamics: geometric brownian motion with jumps
     base_prices = {
         "BTCUSDT": 60000, "ETHUSDT": 3000, "BNBUSDT": 500, "SOLUSDT": 150,
         "XRPUSDT": 0.6, "ADAUSDT": 0.5, "DOGEUSDT": 0.15, "AVAXUSDT": 35,
@@ -52,27 +47,22 @@ def generate_synthetic_candles(symbol: str, interval: str = "1h", days: int = 90
     base = base_prices.get(symbol, 10.0)
     
     returns = np.random.normal(0.0001, 0.02, len(ts))
-    # Add some autocorrelation and volatility clustering
     for i in range(1, len(returns)):
         returns[i] += 0.1 * returns[i-1]
         if abs(returns[i-1]) > 0.03:
             returns[i] *= 1.5
     
     prices = base * np.exp(np.cumsum(returns))
-    
-    # Generate OHLC from close
     close = prices
     high = close * (1 + np.random.uniform(0, 0.01, len(ts)))
     low = close * (1 - np.random.uniform(0, 0.01, len(ts)))
     open_p = np.roll(close, 1)
     open_p[0] = close[0] * (1 + np.random.normal(0, 0.005))
     
-    # Ensure OHLC consistency
     high = np.maximum(high, np.maximum(open_p, close))
     low = np.minimum(low, np.minimum(open_p, close))
     
     volume = np.random.lognormal(10, 1, len(ts))
-    # Volume correlates with volatility
     volume = volume * (1 + 3 * np.abs(returns))
     
     df = pd.DataFrame({
@@ -97,14 +87,19 @@ def generate_synthetic_candles(symbol: str, interval: str = "1h", days: int = 90
     return df
 
 
-def backfill_synthetic(universe_size: int = 30, days: int = 90):
-    """Generate synthetic data for the universe."""
+def backfill_synthetic(universe_size: int = 60, days: int = 90):
+    """Generate synthetic data for the universe. Stored separately from real data."""
     priority_assets = [
         "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT",
         "DOTUSDT", "MATICUSDT", "AVAXUSDT", "LTCUSDT", "LINKUSDT", "ATOMUSDT", "UNIUSDT",
         "XLMUSDT", "ALGOUSDT", "VETUSDT", "FILUSDT", "APTUSDT", "ARBUSDT",
-        "OPUSDT", "SUIUSDT", "SEIUSDT", "TIUSDT", "NEARUSDT", "AAVEUSDT", "MKRUSDT",
-        "RUNEUSDT", "IMXUSDT", "INJUSDT", "PEPEUSDT", "WIFUSDT",
+        "OPUSDT", "SUIUSDT", "SEIUSDT", "NEARUSDT", "AAVEUSDT", "MKRUSDT", "RUNEUSDT",
+        "IMXUSDT", "INJUSDT", "PEPEUSDT", "WIFUSDT", "FLOKIUSDT", "BONKUSDT", "SATSUSDT",
+        "RENDERUSDT", "THETAUSDT", "HNTUSDT", "ENAUSDT", "TRXUSDT", "ETCUSDT",
+        "XMRUSDT", "DASHUSDT", "ZECUSDT", "KSMUSDT", "RENUSDT", "1INCHUSDT", "ENJUSDT",
+        "BATUSDT", "ZRXUSDT", "COMPUSDT", "SNXUSDT", "SUSHIUSDT", "YFIUSDT", "CRVUSDT",
+        "BALUSDT", "OMUSDT", "LRCUSDT", "GRTUSDT", "STORJUSDT", "ANTUSDT", "CVXUSDT",
+        "FXSUSDT", "GLMUSDT", "TIAUSDT", "PIXELUSDT", "PORTALUSDT", "JUPUSDT", "WLDUSDT",
     ]
     symbols = priority_assets[:universe_size]
     
@@ -112,13 +107,18 @@ def backfill_synthetic(universe_size: int = 30, days: int = 90):
     for sym in symbols:
         for interval in ["1h", "1d"]:
             df = generate_synthetic_candles(sym, interval, days)
-            written = save_candles(df, sym, interval, "spot")
+            # Add synthetic provenance
+            df["source_mode"] = SOURCE_SYNTHETIC
+            df["provider"] = "synthetic_generator"
+            written = save_candles(df, sym, interval, "spot", source_mode=SOURCE_SYNTHETIC, provider="synthetic_generator")
             total += written
     
     # Fine-grain for first 15 symbols
     for sym in symbols[:15]:
         df = generate_synthetic_candles(sym, "1m", days=7)
-        written = save_candles(df, sym, "1m", "spot")
+        df["source_mode"] = SOURCE_SYNTHETIC
+        df["provider"] = "synthetic_generator"
+        written = save_candles(df, sym, "1m", "spot", source_mode=SOURCE_SYNTHETIC, provider="synthetic_generator")
         total += written
     
     log.info("Synthetic backfill complete: %d rows for %d symbols", total, len(symbols))
@@ -126,7 +126,5 @@ def backfill_synthetic(universe_size: int = 30, days: int = 90):
 
 
 if __name__ == "__main__":
-    import logging
     logging.basicConfig(level=logging.INFO)
     backfill_synthetic(60, 90)
-

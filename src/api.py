@@ -15,19 +15,19 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from config import DATA, HOST, PORT, HORIZONS
-from market_data import get_candles, rest_klines, save_candles, fetch_ticker
+from config import DATA, HOST, PORT, HORIZONS, SOURCE_LIVE, SOURCE_HISTORICAL, SOURCE_SYNTHETIC
+from market_data import get_candles, rest_klines, save_candles, fetch_ticker, test_provider_connectivity
 from universe import load_universe, build_universe
-from backfill import backfill_symbol, verify_backfill, backfill_universe, load_backfill_state
+from backfill import backfill_symbol, verify_backfill, backfill_universe, reconcile_gaps, load_backfill_state
 from features import build_feature_dataset, load_features
-from train import run_training, predict, load_features as _lf
+from train import run_training, predict, _check_provenance, MODELS
 from journal import compute_journal_summary, record_prediction, mature_predictions
-from live import get_live_status, start_live, stop_live, reconcile_gaps
+from live import get_live_status, start_live, stop_live
+from sources import load_sources, approved_sources
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="NeuroTrom Crypto", version="0.1.0")
 
-# Serve dashboard
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 if UI_DIR.exists() and (UI_DIR / "index.html").exists():
     app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
@@ -61,13 +61,75 @@ def health():
 def status():
     live = get_live_status()
     backfill = load_backfill_state()
+    
+    # Provider connectivity (cached to avoid slow status page)
+    from functools import lru_cache
+    @lru_cache(maxsize=1)
+    def _cached_providers():
+        return {"binance": test_provider_connectivity("binance"), "kraken": test_provider_connectivity("kraken")}
+    providers = _cached_providers()
+    binance, kraken = providers["binance"], providers["kraken"]
+    any_provider = binance.get("reachable", False) or kraken.get("reachable", False)
+    
+    # Data provenance
+    df = load_universe()
+    real_data_available = False
+    synthetic_only = True
+    if not df.empty and "symbol" in df.columns:
+        sample_sym = df["symbol"].iloc[0]
+        for interval in ["1h", "1d"]:
+            real_df = get_candles(sample_sym, interval, "spot", source_mode=SOURCE_HISTORICAL)
+            live_df = get_candles(sample_sym, interval, "spot", source_mode=SOURCE_LIVE)
+            if not real_df.empty or not live_df.empty:
+                real_data_available = True
+                synthetic_only = False
+    
+    # Models
+    model_provenances = []
+    for h in HORIZONS:
+        prov_path = MODELS / f"crypto_{h}_provenance.json"
+        if prov_path.exists():
+            try:
+                prov = json.loads(prov_path.read_text())
+                model_provenances.append(prov.get("provenance", "UNKNOWN"))
+            except Exception:
+                pass
+    real_models = sum(1 for p in model_provenances if p != SOURCE_SYNTHETIC)
+    
+    # Predictions
+    journal = compute_journal_summary()
+    real_preds = journal.get("real_predictions", 0)
+    
+    # Overall
+    if not any_provider and not real_data_available:
+        overall = "BLOCKED — no real data provider reachable"
+    elif real_data_available and real_models > 0 and real_preds > 0:
+        overall = "OK"
+    elif real_data_available:
+        overall = "DEGRADED — real data available, no real predictions yet"
+    else:
+        overall = "DEGRADED — synthetic data only"
+    
     return _clean({
         "status": "ok",
-        "live": live,
+        "overall": overall,
+        "api_live": True,
+        "real_data_available": real_data_available,
+        "synthetic_only": synthetic_only,
+        "any_provider": any_provider,
+        "providers": {"binance": binance, "kraken": kraken},
+        "models_ready": len(model_provenances) > 0,
+        "real_models": real_models,
+        "real_predictions": real_preds,
+        "universe_count": len(df),
         "backfill_last_run": backfill.get("last_run"),
-        "universe_count": len(load_universe()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@app.get("/v1/crypto/sources")
+def sources():
+    return _clean({"sources": [s.to_dict() for s in load_sources()]})
 
 
 @app.get("/v1/crypto/universe")
@@ -77,34 +139,33 @@ def universe():
 
 
 @app.get("/v1/crypto/market")
-def market(symbol: str = "BTCUSDT"):
+def market(symbol: str = "BTCUSDT", provider: str = "binance"):
     try:
-        t = fetch_ticker(symbol, "spot")
+        t = fetch_ticker(symbol, "spot", provider)
         return _clean(t)
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
 @app.get("/v1/crypto/candles")
-def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200):
-    df = get_candles(symbol, interval, "spot")
+def candles(symbol: str = "BTCUSDT", interval: str = "1h", limit: int = 200, source_mode: Optional[str] = None):
+    df = get_candles(symbol, interval, "spot", source_mode=source_mode)
     if df.empty:
-        # Try live fetch
         try:
             raw = rest_klines(symbol, interval, limit=limit)
             if not raw.empty:
-                save_candles(raw, symbol, interval, "spot")
+                save_candles(raw, symbol, interval, "spot", source_mode=SOURCE_HISTORICAL, provider="binance")
                 df = raw
         except Exception:
             pass
     if df.empty:
         raise HTTPException(404, f"No candles for {symbol} {interval}")
     df = df.tail(limit)
-    return _clean(df[["timestamp", "open", "high", "low", "close", "volume"]].to_dict(orient="records"))
+    return _clean(df[["timestamp", "open", "high", "low", "close", "volume", "source_mode", "provider"]].to_dict(orient="records"))
 
 
 @app.get("/v1/crypto/predictions")
-def predictions(symbol: Optional[str] = None, horizon: str = "24h"):
+def predictions(symbol: Optional[str] = None, horizon: str = "24h", source_mode: Optional[str] = None):
     from journal import PREDICTIONS
     if not PREDICTIONS.exists():
         return {"predictions": [], "note": "no predictions yet"}
@@ -113,6 +174,8 @@ def predictions(symbol: Optional[str] = None, horizon: str = "24h"):
         df = df[df["horizon"] == horizon]
     if symbol:
         df = df[df["symbol"] == symbol]
+    if source_mode:
+        df = df[df.get("source_mode", SOURCE_SYNTHETIC) == source_mode]
     df = df.sort_values("timestamp", ascending=False).head(200)
     return _clean({"predictions": df.to_dict(orient="records")})
 
@@ -138,9 +201,13 @@ def system_health():
     live = get_live_status()
     backfill = load_backfill_state()
     df = load_universe()
+    providers = _cached_providers()
+    binance, kraken = providers["binance"], providers["kraken"]
     return _clean({
+        "api_live": True,
         "live_collector_running": live.get("collector_running", False),
         "live_last_update": live.get("last_update"),
+        "providers": {"binance": binance, "kraken": kraken},
         "backfill_last_run": backfill.get("last_run"),
         "backfill_errors": len(backfill.get("errors", [])),
         "universe_count": len(df),
@@ -149,9 +216,30 @@ def system_health():
     })
 
 
+@app.get("/v1/crypto/models")
+def models_status():
+    result = []
+    for h in HORIZONS:
+        prov_path = MODELS / f"crypto_{h}_provenance.json"
+        model_path = MODELS / f"crypto_{h}.txt"
+        if prov_path.exists():
+            try:
+                prov = json.loads(prov_path.read_text())
+                result.append({
+                    "horizon": h,
+                    "provenance": prov.get("provenance", "UNKNOWN"),
+                    "trained_at": prov.get("saved_at"),
+                    "model_path": prov.get("model_path"),
+                })
+            except Exception:
+                pass
+        elif model_path.exists():
+            result.append({"horizon": h, "provenance": "UNKNOWN", "model_path": str(model_path)})
+    return _clean(result)
+
+
 @app.post("/v1/crypto/backfill")
 def trigger_backfill(days: int = 7):
-    """Trigger a backfill job."""
     try:
         from backfill import backfill_universe
         rows, errors = backfill_universe(days=days)
@@ -161,20 +249,19 @@ def trigger_backfill(days: int = 7):
 
 
 @app.post("/v1/crypto/train")
-def trigger_training():
-    """Trigger model training."""
+def trigger_training(allow_synthetic: bool = False):
     try:
-        report = run_training()
+        report = run_training(allow_synthetic=allow_synthetic)
         return _clean(report)
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
 @app.post("/v1/crypto/predict")
-def generate_predictions(horizon: str = "24h"):
-    """Generate predictions for all symbols in universe."""
+def generate_predictions(horizon: str = "24h", source_mode: Optional[str] = None):
     try:
-        df = build_feature_dataset()
+        from features import build_feature_dataset
+        df = build_feature_dataset(require_real=(source_mode != SOURCE_SYNTHETIC))
         if df.empty:
             raise HTTPException(400, "No feature data")
         
@@ -188,6 +275,7 @@ def generate_predictions(horizon: str = "24h"):
             score = preds[mask].mean()
             price_row = df[mask].iloc[-1] if not df[mask].empty else None
             price = float(price_row["close"]) if price_row is not None else 0.0
+            src = df[mask]["source_mode"].iloc[0] if "source_mode" in df.columns and not df[mask].empty else SOURCE_SYNTHETIC
             
             record_prediction(
                 symbol=symbol,
@@ -197,8 +285,9 @@ def generate_predictions(horizon: str = "24h"):
                 model_version=f"crypto_{horizon}",
                 feature_version="v1",
                 price=price,
+                source_mode=src,
             )
-            results.append({"symbol": symbol, "score": float(score), "price": price})
+            results.append({"symbol": symbol, "score": float(score), "price": price, "source_mode": src})
         
         return _clean({"predictions": sorted(results, key=lambda x: x["score"], reverse=True)[:50], "horizon": horizon})
     except HTTPException:
@@ -227,7 +316,7 @@ def live_status():
 def _disk_usage_mb() -> float:
     try:
         total = 0
-        for root, dirs, files in os_walk(str(DATA)):
+        for root, dirs, files in os.walk(str(DATA)):
             for f in files:
                 fp = Path(root) / f
                 if fp.exists():
@@ -237,12 +326,6 @@ def _disk_usage_mb() -> float:
         return -1
 
 
-def os_walk(path):
-    import os
-    return os.walk(path)
-
-
-# Serve index.html at root
 @app.get("/")
 def root():
     idx = UI_DIR / "index.html"
@@ -254,4 +337,3 @@ def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
-

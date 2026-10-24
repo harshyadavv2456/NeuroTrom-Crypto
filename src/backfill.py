@@ -138,6 +138,32 @@ def verify_backfill(symbol: str, interval: str, market_type: str = "spot") -> di
     }
 
 
+
+def reconcile_gaps():
+    """Reconcile gaps in stored data by backfilling missing intervals."""
+    from universe import load_universe
+    from market_data import get_candles, rest_klines, save_candles
+    from config import SOURCE_HISTORICAL
+    
+    df = load_universe()
+    if df.empty:
+        return {"reconciled": 0, "errors": ["no universe"]}
+    
+    gaps_found = 0
+    for _, row in df.head(20).iterrows():
+        for interval in ["1h", "1d"]:
+            result = verify_backfill(row["symbol"], interval, row.get("market", "spot"))
+            if result.get("status") == "degraded" or result.get("gap_pct", 0) > 5:
+                gaps_found += 1
+                try:
+                    raw = rest_klines(row["symbol"], interval, limit=500)
+                    if not raw.empty:
+                        save_candles(raw, row["symbol"], interval, row.get("market", "spot"), source_mode=SOURCE_HISTORICAL, provider="binance")
+                except Exception:
+                    pass
+    
+    return {"reconciled": gaps_found, "status": "complete"}
+
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)

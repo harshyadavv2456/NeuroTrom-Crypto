@@ -3,7 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path.home() / "Library" / "Application Support" / "NeuroTrom-Crypto"
-for sub in ("raw/market", "market", "features", "models", "runs", "journal", "state", "logs", "reports"):
+for sub in ("raw/market", "market", "features", "models", "runs", "journal", "state", "logs", "reports", "synthetic"):
     (DATA / sub).mkdir(parents=True, exist_ok=True)
 
 PORT = 8775
@@ -11,6 +11,7 @@ HOST = "127.0.0.1"
 
 # Data source settings
 PRIMARY_EXCHANGE = "binance"
+SECONDARY_EXCHANGE = "kraken"
 PRIMARY_MARKET = "spot"
 UNIVERSE_SIZE = 60
 MAX_BACKFILL_CONCURRENCY = 4
@@ -32,8 +33,8 @@ BASE_PARAMS = dict(
 )
 ROUNDS = 500
 N_FOLDS = 5
-GAP = 5  # walk-forward gap in bars
-COST_BPS = 10  # 10 bps per trade
+GAP = 5
+COST_BPS = 10
 
 # Intervals for history
 HISTORY_INTERVALS = ["1h", "1d"]
@@ -41,4 +42,9 @@ FINE_GRAIN_INTERVALS = ["1m"]
 FINE_GRAIN_UNIVERSE_SIZE = 15
 
 # Data retention
-CANDLE_RETENTION_DAYS = 365 * 3  # 3 years
+CANDLE_RETENTION_DAYS = 365 * 3
+
+# Source provenance modes
+SOURCE_LIVE = "LIVE_EXCHANGE"
+SOURCE_HISTORICAL = "HISTORICAL_EXCHANGE"
+SOURCE_SYNTHETIC = "SYNTHETIC_DEMO"
