@@ -45,3 +45,9 @@ config.local.json
 api.pid
 run_train.py
 *.pid
+
+# Cloud workflow outputs: regenerated on every scheduled Actions run
+.cloud-work/
+site/data/*.json
+site/data/*.csv
+!site/data/.gitkeep
