@@ -301,7 +301,8 @@ def backfill_symbol(symbol: str, interval: str, start: datetime, end: datetime, 
     if not existing_real.empty and "provider" in existing_real.columns:
         existing_real = existing_real[existing_real["provider"].astype(str).str.lower() == provider.lower()]
     existing_end = existing_real["timestamp"].max().to_pydatetime() if not existing_real.empty else None
-    if existing_end and existing_end >= end - pd.Timedelta(hours=2):
+    freshness_hours = 26 if interval == "1d" else 2
+    if existing_end and existing_end >= end - pd.Timedelta(hours=freshness_hours):
         log.info("Backfill for %s %s %s already complete through %s", symbol, interval, market_type, existing_end)
         return total_rows
     
