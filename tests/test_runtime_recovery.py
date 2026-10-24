@@ -82,3 +82,65 @@ def test_binance_connectivity_probe_checks_alternate_hosts(monkeypatch):
     assert result["reachable"] is True
     assert result["host"] == "https://api-gcp.binance.com"
     assert result["transport"] == "curl-fallback"
+
+
+
+def test_coindcx_market_discovery_preserves_exact_quote(monkeypatch):
+    markets = [
+        {"status": "active", "symbol": "BTCUSDT", "target_currency_short_name": "BTC",
+         "base_currency_short_name": "USDT", "pair": "B-BTC_USDT"},
+        {"status": "active", "symbol": "BTCINR", "target_currency_short_name": "BTC",
+         "base_currency_short_name": "INR", "pair": "I-BTC_INR"},
+        {"status": "inactive", "symbol": "ETHUSDT", "target_currency_short_name": "ETH",
+         "base_currency_short_name": "USDT", "pair": "B-ETH_USDT"},
+    ]
+    monkeypatch.setattr("universe.http_get", lambda *a, **k: SimpleNamespace(json=lambda: markets))
+    result = __import__("universe").discover_coindcx_universe("USDT")
+    assert result["symbol"].tolist() == ["BTCUSDT"]
+    assert result.iloc[0]["exchange_pair"] == "B-BTC_USDT"
+    assert result.iloc[0]["exchange"] == "coindcx"
+
+
+def test_coindcx_live_ticker_uses_public_endpoint_only(monkeypatch):
+    market_data._COINDCX_TICKERS_CACHE = {}
+    market_data._COINDCX_TICKERS_CACHE_AT = 0.0
+    calls = []
+
+    def fake_http_get(url, params=None, timeout=15):
+        calls.append(url)
+        return SimpleNamespace(
+            json=lambda: [{
+                "market": "BTCUSDT", "last_price": "68000", "change_24_hour": "2.5",
+                "volume": "1200", "high": "69000", "low": "66000", "timestamp": 1792860000000,
+            }],
+            headers={"X-NeuroTrom-Transport": "requests"},
+        )
+
+    monkeypatch.setattr(market_data, "http_get", fake_http_get)
+    result = market_data.fetch_ticker("BTCUSDT", provider="coindcx")
+    assert result["provider"] == "coindcx"
+    assert result["price"] == 68000.0
+    assert result["source_mode"] == "LIVE_EXCHANGE"
+    assert calls == ["https://api.coindcx.com/exchange/ticker"]
+    assert not any("/orders/" in url for url in calls)
+
+
+def test_coindcx_candles_are_normalized_and_unfinished_bar_removed(monkeypatch):
+    market_data._COINDCX_MARKETS_CACHE = [{
+        "status": "active", "symbol": "BTCUSDT", "coindcx_name": "BTCUSDT", "pair": "B-BTC_USDT"
+    }]
+    market_data._COINDCX_MARKETS_CACHE_AT = 9999999999
+    future_open = int((pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=1)).timestamp() * 1000)
+    old_open = int((pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=2)).floor("h").timestamp() * 1000)
+
+    def fake_http_get(url, params=None, timeout=15):
+        return SimpleNamespace(json=lambda: [
+            {"time": future_open, "open": 1, "high": 2, "low": 1, "close": 2, "volume": 10},
+            {"time": old_open, "open": 1, "high": 2, "low": 1, "close": 2, "volume": 10},
+        ])
+
+    monkeypatch.setattr(market_data, "http_get", fake_http_get)
+    result = market_data.coindcx_ohlc("BTCUSDT", interval="1h")
+    assert len(result) == 1
+    assert result.iloc[0]["exchange"] == "coindcx"
+    assert result.iloc[0]["source_mode"] == "HISTORICAL_EXCHANGE"
