@@ -66,6 +66,8 @@ def _real_candle_counts(universe: pd.DataFrame) -> dict:
     for symbol in universe["symbol"].astype(str).tolist():
         for interval in ("1h", "1d"):
             df = get_candles(symbol, interval, "spot")
+            demo_df = get_candles(symbol, interval, "spot", source_mode=SOURCE_SYNTHETIC)
+            synthetic_rows += len(demo_df)
             if df.empty:
                 continue
             if "source_mode" not in df.columns:
@@ -73,8 +75,7 @@ def _real_candle_counts(universe: pd.DataFrame) -> dict:
                 continue
             modes = df["source_mode"].astype(str)
             real_mask = modes.isin([SOURCE_LIVE, SOURCE_HISTORICAL])
-            synthetic_rows += int(modes.eq(SOURCE_SYNTHETIC).sum())
-            unknown_rows += int((~real_mask & ~modes.eq(SOURCE_SYNTHETIC)).sum())
+            unknown_rows += int((~real_mask).sum())
             real_rows += int(real_mask.sum())
             if real_mask.any():
                 real_series += 1
@@ -110,6 +111,8 @@ def main() -> int:
     }
     check("data", "real_exchange_candles_persisted",
           (data["real_rows"] > 0, json.dumps(data, sort_keys=True)))
+    check("data", "synthetic_archive_not_served_as_production",
+          (data["unknown_rows"] == 0, f"archive rows={data['synthetic_rows']}; unknown production rows={data['unknown_rows']}"))
 
     features = build_feature_dataset(interval="1h", require_real=True)
     feature_modes = set(features["source_mode"].astype(str).unique()) if not features.empty and "source_mode" in features.columns else set()
@@ -188,7 +191,7 @@ def main() -> int:
         f"- Overall: **{overall}**",
         f"- Real exchange universe: {len(universe)} instruments",
         f"- Real candle rows: {data['real_rows']}",
-        f"- Synthetic rows in active universe files: {data['synthetic_rows']}",
+        f"- Synthetic rows in isolated demo archive: {data['synthetic_rows']}",
         f"- Unknown-provenance rows: {data['unknown_rows']}",
         f"- Real forward predictions: {real_predictions}",
         "",
