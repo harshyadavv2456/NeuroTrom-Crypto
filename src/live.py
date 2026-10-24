@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -165,9 +166,19 @@ class LiveCollector:
         return bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set())
 
     def start(self) -> None:
+        state = load_live_state()
+        state["desired_state"] = "running"
+        save_live_state(state)
         with self._lock:
             if self.thread and self.thread.is_alive():
-                log.info("Collector is already running")
+                self.stop_event.clear()
+                log.info("Collector thread is already running")
+                return
+            # If launchd owns the process, update desired_state only; the process
+            # already holding the cross-process lock will resume on its next cycle.
+            owner_pid = state.get("pid")
+            if owner_pid and _pid_alive(owner_pid):
+                log.info("Collector process %s already owns the runtime; requested start", owner_pid)
                 return
             self.stop_event.clear()
             self.thread = threading.Thread(
@@ -178,10 +189,14 @@ class LiveCollector:
             self.thread.start()
 
     def stop(self) -> None:
-        self.stop_event.set()
-        thread = self.thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=15)
+        # A persisted control state works for either the launchd process or the
+        # API-managed thread. KeepAlive can restart a process, but it will remain
+        # paused until the user explicitly starts it again.
+        state = load_live_state()
+        state["desired_state"] = "paused"
+        state["status"] = "paused"
+        state["streams"] = []
+        save_live_state(state)
 
     def _update_status(self, **updates) -> None:
         state = load_live_state()
@@ -299,31 +314,51 @@ class LiveCollector:
         return len(ok_symbols), errors, providers
 
     def run_forever(self) -> None:
-        """Blocking worker used by both launchd and the API-managed thread."""
-        log.info("NeuroTrom Crypto live collector starting")
+        """Blocking single-instance worker used by launchd and the API."""
+        STATE.mkdir(parents=True, exist_ok=True)
+        lock_handle = (STATE / "live_collector.lock").open("a+")
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log.info("Another NeuroTrom Crypto collector already owns the lock")
+            lock_handle.close()
+            return
+
+        prior = load_live_state()
+        desired = prior.get("desired_state", "running")
+        self.stop_event.clear()
+        log.info("NeuroTrom Crypto live collector starting (pid=%s)", os.getpid())
         save_live_state({
-            "running": True,
+            **prior,
+            "pid": os.getpid(),
+            "running": desired != "paused",
             "collector_running": True,
-            "status": "starting",
+            "status": "paused" if desired == "paused" else "starting",
             "started_at": _now_iso(),
-            "last_update": load_live_state().get("last_update"),
-            "streams": [],
-            "errors": [],
-            "provider_status": {},
+            "last_update": prior.get("last_update"),
+            "streams": [] if desired == "paused" else prior.get("streams", []),
+            "errors": prior.get("errors", []),
+            "provider_status": prior.get("provider_status", {}),
+            "desired_state": desired,
         })
         try:
             while not self.stop_event.is_set():
+                state = load_live_state()
+                if state.get("desired_state", "running") == "paused":
+                    self._update_status(running=False, collector_running=True, status="paused", streams=[])
+                    self.stop_event.wait(2.0)
+                    continue
+
                 started = time.monotonic()
                 try:
                     count, errors, providers = self._cycle()
-                    log.info("Collector cycle: %d real tickers; %d errors; providers=%s",
+                    log.info("Collector cycle: %d real ticker snapshots; %d errors; providers=%s",
                              count, len(errors), {k: v.get("reachable") for k, v in providers.items()})
                 except Exception as exc:
                     log.exception("Collector cycle failed: %s", exc)
                     self._update_status(status="degraded", errors=[f"{type(exc).__name__}: {str(exc)[:300]}"])
                 elapsed = time.monotonic() - started
-                wait_s = max(2.0, POLL_INTERVAL_SECONDS - elapsed)
-                self.stop_event.wait(wait_s)
+                self.stop_event.wait(max(2.0, POLL_INTERVAL_SECONDS - elapsed))
         finally:
             state = load_live_state()
             state.update({
@@ -331,12 +366,28 @@ class LiveCollector:
                 "collector_running": False,
                 "status": "stopped",
                 "stopped_at": _now_iso(),
+                "pid": None,
             })
             save_live_state(state)
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_handle.close()
             log.info("NeuroTrom Crypto live collector stopped")
 
 
 _collector = LiveCollector()
+
+
+def _pid_alive(value) -> bool:
+    try:
+        pid = int(value)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
+        return False
 
 
 def start_live() -> None:
@@ -349,8 +400,9 @@ def stop_live() -> None:
 
 def get_live_status() -> dict:
     state = load_live_state()
-    state["collector_running"] = _collector.running
-    state["running"] = _collector.running or state.get("running", False)
+    owner_alive = _pid_alive(state.get("pid"))
+    state["collector_running"] = _collector.running or owner_alive
+    state["running"] = state["collector_running"] and state.get("desired_state", "running") != "paused"
     if state.get("last_update"):
         try:
             stamp = pd.Timestamp(state["last_update"])
