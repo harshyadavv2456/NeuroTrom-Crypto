@@ -27,10 +27,47 @@ SYNTHETIC = DATA / "synthetic"
 STATE = DATA / "state"
 
 BINANCE_REST = "https://api.binance.com"
+# Official Binance Spot REST failover hosts. The final host is dedicated to
+# public market-data endpoints and does not require API credentials.
+BINANCE_SPOT_REST_HOSTS = (
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+    "https://data-api.binance.vision",
+)
 BINANCE_FUTURES_REST = "https://fapi.binance.com"
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
 BINANCE_FUTURES_WS = "wss://fstream.binance.com/ws"
 KRAKEN_REST = "https://api.kraken.com/0/public"
+
+
+def _binance_get(path: str, params: dict | None = None, timeout: float = 15,
+                 market_type: str = "spot") -> requests.Response:
+    """GET public data from Binance, failing over hosts only for transport failures.
+
+    HTTP errors (including 4xx/429) are surfaced immediately rather than masked by
+    switching hosts; the caller must handle authorization and rate-limit responses.
+    """
+    if market_type == "spot":
+        hosts = BINANCE_SPOT_REST_HOSTS
+    else:
+        hosts = (BINANCE_FUTURES_REST,)
+
+    errors = []
+    for host in hosts:
+        try:
+            return http_get(f"{host}{path}", params=params, timeout=timeout)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                requests.exceptions.SSLError) as exc:
+            errors.append(f"{host}: {type(exc).__name__}: {str(exc)[:180]}")
+            log.warning("Binance transport failed at %s; trying next official host", host)
+
+    raise requests.exceptions.ConnectionError(
+        "All Binance REST hosts failed: " + " | ".join(errors)
+    )
 
 
 def _now_iso():
@@ -70,15 +107,14 @@ def _dedupe_candles(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
 
 def rest_klines(symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None, limit: int = 1000, market_type: str = "spot") -> pd.DataFrame:
     """Fetch klines from Binance REST API. Returns empty DataFrame on failure."""
-    base = BINANCE_REST if market_type == "spot" else BINANCE_FUTURES_REST
-    url = f"{base}/api/v3/klines" if market_type == "spot" else f"{base}/fapi/v1/klines"
+    path = "/api/v3/klines" if market_type == "spot" else "/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     if start_ms is not None:
         params["startTime"] = start_ms
     if end_ms is not None:
         params["endTime"] = end_ms
-    
-    r = http_get(url, params=params, timeout=30)
+
+    r = _binance_get(path, params=params, timeout=30, market_type=market_type)
     r.raise_for_status()
     raw = r.json()
     
@@ -568,9 +604,8 @@ def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binanc
         raise RuntimeError("No ticker provider available: " + "; ".join(errors))
 
     if provider == "binance":
-        base = BINANCE_REST if market_type == "spot" else BINANCE_FUTURES_REST
-        url = f"{base}/api/v3/ticker/24hr" if market_type == "spot" else f"{base}/fapi/v1/ticker/24hr"
-        response = http_get(url, params={"symbol": symbol}, timeout=5)
+        path = "/api/v3/ticker/24hr" if market_type == "spot" else "/fapi/v1/ticker/24hr"
+        response = _binance_get(path, params={"symbol": symbol}, timeout=8, market_type=market_type)
         data = response.json()
         return {
             "symbol": data["symbol"],
@@ -616,12 +651,26 @@ def fetch_ticker(symbol: str, market_type: str = "spot", provider: str = "binanc
 def test_provider_connectivity(provider: str = "binance") -> dict:
     """Test connectivity to a provider."""
     if provider == "binance":
-        try:
-            t0 = time.monotonic()
-            r = http_get(f"{BINANCE_REST}/api/v3/ping", timeout=4)
-            return {"provider": "binance", "reachable": r.status_code == 200, "latency_ms": round((time.monotonic() - t0) * 1000, 1), "transport": r.headers.get("X-NeuroTrom-Transport", "requests")}
-        except Exception as e:
-            return {"provider": "binance", "reachable": False, "error": str(e)}
+        errors = []
+        for host in BINANCE_SPOT_REST_HOSTS:
+            try:
+                t0 = time.monotonic()
+                r = http_get(f"{host}/api/v3/ping", timeout=5)
+                return {
+                    "provider": "binance",
+                    "reachable": r.status_code == 200,
+                    "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                    "transport": r.headers.get("X-NeuroTrom-Transport", "requests"),
+                    "host": host,
+                }
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                    requests.exceptions.SSLError) as e:
+                errors.append(f"{host}: {type(e).__name__}: {str(e)[:160]}")
+                continue
+            except Exception as e:
+                # Non-transport errors should remain visible, not be hidden by failover.
+                return {"provider": "binance", "reachable": False, "host": host, "error": str(e)}
+        return {"provider": "binance", "reachable": False, "error": "All Binance hosts failed: " + " | ".join(errors)}
     elif provider == "kraken":
         try:
             t0 = time.monotonic()
