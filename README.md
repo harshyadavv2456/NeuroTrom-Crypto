@@ -19,7 +19,7 @@ These are compact research outputs, not a raw historical exchange-data dump. The
 `.github/workflows/daily-research.yml` schedules the data/model pipeline for approximately **06:17 Asia/Kolkata every day** (00:47 UTC) and supports manual runs from the Actions tab. It:
 
 1. Checks Binance's documented public market-data REST hosts, with failover.
-2. Fetches up to 365 days of completed hourly candles for BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT and BNBUSDT, plus current 24-hour tickers.
+2. Fetches up to 365 days of completed hourly candles for BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, BNBUSDT, ADAUSDT, DOGEUSDT, LINKUSDT, AVAXUSDT and LTCUSDT, plus current 24-hour tickers.
 3. Optionally checks and downloads a configured Kaggle dataset. The pipeline inspects its update timestamp and license, and only accepts exact-symbol, hourly USDT OHLCV rows from an explicit permissive-license allowlist. Compatible Kaggle rows may extend history **before** the fetched API window; stale, daily-only, quote-mismatched or unknown-license data is reported and not silently treated as current.
 4. Retrains 1h, 4h, 24h and 7d LightGBM models from the verified hourly series, checks time-ordered holdout metrics, and creates forecasts only when usable data and models exist.
 5. Publishes JSON/CSV results to GitHub Pages even when a run is degraded, so the dashboard reports the failure instead of showing old data as current.
@@ -48,7 +48,14 @@ The workflow generates `site/data/daily_update.csv` every run. After GitHub Page
 
 `https://harshyadavv2456.github.io/NeuroTrom-Crypto/data/daily_update.csv`
 
-Set the Kaggle dataset's interval refresh to daily. Kaggle documents interval updates for datasets created from GitHub or remote files. This is separate from the optional historical input above.
+Set the Kaggle dataset's interval refresh to daily. Kaggle documents interval updates for datasets created from GitHub or remote files.
+
+For direct dataset-version updates from GitHub Actions, an **existing, separate snapshot-only Kaggle dataset** can be configured with:
+- repository variable `KAGGLE_OUTPUT_DATASET` = `owner/neurotrom-crypto-daily-snapshot` (use the actual owner/slug)
+- repository variable `KAGGLE_OUTPUT_PUBLISH` = `true`
+- the same Kaggle API credential secret described above
+
+The snapshot target must be separate from `KAGGLE_INPUT_DATASET`; the workflow refuses to overwrite the historical input. It creates a new version from `daily_update.csv` after the Pages deployment. Keep this optional publisher disabled until rights for publishing the snapshot have been reviewed. If there is no dedicated target dataset, the Pages CSV remains the automated daily feed and no Kaggle update is attempted.
 
 ## Run and test locally
 
