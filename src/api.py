@@ -43,6 +43,7 @@ def _provider_status(refresh: bool = False) -> dict:
     _PROVIDER_CACHE = {
         "binance": test_provider_connectivity("binance"),
         "kraken": test_provider_connectivity("kraken"),
+        "coindcx": test_provider_connectivity("coindcx"),
     }
     _PROVIDER_CACHE_AT = time.monotonic()
     return _PROVIDER_CACHE
@@ -66,7 +67,7 @@ def _resolve_exchange_symbol(symbol: str) -> tuple[str, str] | None:
         return None
     if "exchange" not in universe_df.columns:
         return None
-    real = universe_df[universe_df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    real = universe_df[universe_df["exchange"].astype(str).str.lower().isin(["binance", "kraken", "coindcx"])].copy()
     if real.empty:
         return None
     if "base_asset" in real.columns:
@@ -115,8 +116,7 @@ def status():
     backfill = load_backfill_state()
     
     providers = _provider_status()
-    binance, kraken = providers["binance"], providers["kraken"]
-    any_provider = binance.get("reachable", False) or kraken.get("reachable", False)
+    any_provider = any(item.get("reachable", False) for item in providers.values())
 
     # Count real and synthetic observations across the whole universe, not only
     # the first symbol. Read the provenance on persisted candles, not file age.
