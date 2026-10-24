@@ -1,55 +1,33 @@
-# Runbook
+# Runbook — cloud-first
 
-## Start API
-```bash
-cd ~/neurotrom-crypto
-PYTHONPATH="" ~/neurotrom-crypto/.venv/bin/python -m uvicorn src.api:app --host 127.0.0.1 --port 8775
-```
+## Normal operation
 
-## Stop API
-```bash
-launchctl stop com.neurotrom.crypto.api
-# or
-pkill -f "uvicorn src.api:app"
-```
+GitHub Actions runs `.github/workflows/daily-research.yml` daily at 00:47 UTC (approximately 06:17 Asia/Kolkata), and also supports manual runs from the Actions tab. Each run fetches public market data, optionally inspects Kaggle history, retrains and evaluates the four research models, matures the prediction journal, and deploys the latest static JSON/CSV and dashboard to Pages.
 
-## Backfill (synthetic fallback or real when reachable)
-```bash
-cd ~/neurotrom-crypto
-PYTHONPATH="" ~/neurotrom-crypto/.venv/bin/python src/backfill.py
-```
+- Dashboard: https://harshyadavv2456.github.io/NeuroTrom-Crypto/
+- Latest JSON: https://harshyadavv2456.github.io/NeuroTrom-Crypto/data/latest.json
+- Daily CSV: https://harshyadavv2456.github.io/NeuroTrom-Crypto/data/daily_update.csv
+- Workflow: GitHub → Actions → Daily Crypto Refresh and GitHub Pages
+- Manual refresh: choose the workflow and select **Run workflow**.
 
-## Retrain (requires real data)
-```bash
-cd ~/neurotrom-crypto
-PYTHONPATH="" ~/neurotrom-crypto/.venv/bin/python src/train.py
-# or via API
-curl -X POST http://127.0.0.1:8775/v1/crypto/train
-```
+## One-time setup
 
-## Health check (nonzero exit = degraded/blocked)
-```bash
-cd ~/neurotrom-crypto
-PYTHONPATH="" ~/neurotrom-crypto/.venv/bin/python src/health.py
-echo $?
-```
+1. Set the repository visibility to public after scanning tracked files and history for credentials and removing the historical FinVest parity document.
+2. Under Settings → Pages, set the publishing source to GitHub Actions.
+3. Enable Actions for the repository.
+4. Optionally set repository variable `KAGGLE_INPUT_DATASET` and configure secrets `KAGGLE_API_TOKEN` or `KAGGLE_USERNAME` plus `KAGGLE_KEY`.
+5. After confirming the Kaggle source's licence and data timestamps, manually run the daily workflow and inspect its full log.
 
-## End-to-end verification
-```bash
-cd ~/neurotrom-crypto
-PYTHONPATH="" ~/neurotrom-crypto/.venv/bin/python src/e2e.py
-```
+## Kaggle freshness
 
-## Current state
-- Dashboard: http://127.0.0.1:8775
-- Overall status: BLOCKED — no real data provider reachable
-- Data: 286,204 synthetic candles (SYNTHETIC_DEMO), 68 symbols
-- Models: 4 LightGBM models trained on synthetic data (research-only)
-- Predictions: 0 real (system correctly refuses to manufacture predictions)
-- Providers: Binance unreachable; Kraken endpoint reachable via curl but Python requests gets ConnectionResetError
+The pipeline records both Kaggle metadata last-updated and latest candle timestamp. Data older than seven days is reported as stale. Stale hourly rows may only extend history before the API window; they are not substituted for current API prices.
 
-## Recovery
-- Backfill is resumable: state is in `state/backfill_state.json`.
-- If the API crashes, launchd restarts it.
-- If the collector crashes, it reconnects with exponential backoff.
-- When a provider becomes reachable from Python, run backfill to populate real data, then retrain.
+The generated CSV is available as a static public file. If publishing it as a Kaggle dataset, review all applicable exchange and dataset licences first. Kaggle documents the ability to create datasets from public remote files and configure interval updates in the Kaggle Dataset Settings.
+
+## Diagnosing a degraded run
+
+Open the latest Actions run and inspect the actual exception, provider host tests, the Kaggle section and each model horizon. The dashboard intentionally remains published when it can generate a degraded status report. It must not claim that a blocked provider or stale candle data is current.
+
+## Cost boundaries
+
+The workflow uses standard GitHub-hosted Ubuntu runners and GitHub Pages (public repo on GitHub Free). It does not use a paid cloud server. Runtime per training run and GitHub account/monthly Actions limits still apply. A GitHub schedule is approximate, not a real-time service-level guarantee.
