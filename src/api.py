@@ -156,9 +156,12 @@ def status():
         if prov_path.exists():
             try:
                 prov = json.loads(prov_path.read_text())
-                model_provenances.append(prov.get("provenance", "UNKNOWN"))
+                if (MODELS / f"crypto_{h}.txt").is_file():
+                    model_provenances.append(prov.get("provenance", "UNKNOWN"))
+                else:
+                    model_provenances.append("MODEL_FILE_MISSING")
             except Exception:
-                pass
+                model_provenances.append("UNKNOWN")
     real_models = sum(1 for p in model_provenances if p in {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"})
     
     # Predictions
@@ -373,22 +376,38 @@ def system_health():
 @app.get("/v1/crypto/models")
 def models_status():
     result = []
+    training_report = {}
+    report_path = DATA / "reports" / "training_report.json"
+    try:
+        training_report = json.loads(report_path.read_text()).get("horizons", {})
+    except (OSError, ValueError, TypeError):
+        training_report = {}
+
+    real_modes = {SOURCE_LIVE, SOURCE_HISTORICAL, "REAL_MIXED"}
     for h in HORIZONS:
         prov_path = MODELS / f"crypto_{h}_provenance.json"
         model_path = MODELS / f"crypto_{h}.txt"
-        if prov_path.exists():
-            try:
+        metric = training_report.get(h, {})
+        provenance = "UNKNOWN"
+        trained_at = None
+        try:
+            if prov_path.exists():
                 prov = json.loads(prov_path.read_text())
-                result.append({
-                    "horizon": h,
-                    "provenance": prov.get("provenance", "UNKNOWN"),
-                    "trained_at": prov.get("saved_at"),
-                    "model_path": prov.get("model_path"),
-                })
-            except Exception:
-                pass
-        elif model_path.exists():
-            result.append({"horizon": h, "provenance": "UNKNOWN", "model_path": str(model_path)})
+                provenance = prov.get("provenance", "UNKNOWN")
+                trained_at = prov.get("saved_at")
+        except (OSError, ValueError, TypeError):
+            pass
+        result.append({
+            "horizon": h,
+            "provenance": provenance if model_path.is_file() else "MODEL_FILE_MISSING",
+            "trained_at": trained_at or metric.get("trained_at"),
+            "model_file_exists": model_path.is_file(),
+            "real_ready": model_path.is_file() and provenance in real_modes,
+            "n_rows": metric.get("n_rows"),
+            "mean_fold_ic": metric.get("mean_fold_ic"),
+            "fold_ics": metric.get("fold_ics"),
+            "metric_note": "Walk-forward validation; not live performance.",
+        })
     return _clean(result)
 
 
