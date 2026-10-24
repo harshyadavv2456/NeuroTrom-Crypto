@@ -7,6 +7,7 @@ It deliberately never falls back to synthetic data.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import sys
@@ -47,7 +48,7 @@ def _write_report(report: dict) -> None:
     tmp.replace(REPORT)
 
 
-def main() -> int:
+def _main() -> int:
     started = datetime.now(timezone.utc).isoformat()
     result: dict = {
         "started_at": started,
@@ -231,6 +232,19 @@ def main() -> int:
     _write_report(result)
     print(json.dumps(result, indent=2, default=str))
     return 0 if all_models_real and created > 0 else 7
+
+
+def main() -> int:
+    """Run at most one real-data bootstrap per machine at a time."""
+    lock_path = DATA / "state" / "bootstrap_real.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("SKIP: another NeuroTrom Crypto real-data bootstrap is already running", flush=True)
+            return 10
+        return _main()
 
 
 if __name__ == "__main__":
