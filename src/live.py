@@ -35,6 +35,9 @@ LIVE_STATE = STATE / "live_state.json"
 TICKER_ROOT = DATA / "market_tickers"
 POLL_INTERVAL_SECONDS = 60
 MIN_REQUEST_INTERVAL_SECONDS = 0.75
+# Kraken's public REST APIs are rate-limited; keep per-provider pacing rather than
+# polling Kraken at Binance's faster cadence.
+PROVIDER_REQUEST_INTERVAL_SECONDS = {"binance": 0.75, "kraken": 1.1}
 STATUS_STALE_SECONDS = 180
 CANDLE_REFRESH_SECONDS = 900
 
@@ -139,7 +142,8 @@ def _refresh_universe_if_needed(provider_status: dict) -> pd.DataFrame:
     must_refresh = current_real.empty or not current_exchanges.intersection(reachable)
     if reachable and must_refresh:
         try:
-            refreshed = build_universe(UNIVERSE_SIZE, preferred_exchange=("binance" if providers.get("binance", {}).get("reachable") else "kraken"))
+            preferred_exchange = "binance" if provider_status.get("binance", {}).get("reachable") else "kraken"
+            refreshed = build_universe(UNIVERSE_SIZE, preferred_exchange=preferred_exchange)
             refreshed_real = _real_universe(refreshed)
             if not refreshed_real.empty:
                 log.info("Refreshed real universe: %d symbols from %s",
@@ -149,7 +153,12 @@ def _refresh_universe_if_needed(provider_status: dict) -> pd.DataFrame:
             log.exception("Could not refresh the real exchange universe")
 
     if not current_real.empty:
-        # Keep only symbols whose assigned provider is currently reachable.
+        # A failed probe is not conclusive: a single ticker request may work even
+        # when the lightweight health-check endpoint is intermittently blocked.
+        # Keep the known real universe when every probe is down so the actual
+        # provider request can attempt its own transport/host fallback.
+        if not reachable:
+            return current_real.reset_index(drop=True)
         return current_real[current_real["exchange"].astype(str).str.lower().isin(reachable)].reset_index(drop=True)
     return pd.DataFrame()
 
@@ -229,7 +238,7 @@ class LiveCollector:
                                      source_mode=SOURCE_HISTORICAL, provider=provider)
             except Exception as exc:
                 log.warning("Recent candle refresh failed for %s via %s: %s", symbol, provider, exc)
-            self.stop_event.wait(MIN_REQUEST_INTERVAL_SECONDS)
+            self.stop_event.wait(PROVIDER_REQUEST_INTERVAL_SECONDS.get(provider, MIN_REQUEST_INTERVAL_SECONDS))
 
     def _cycle(self) -> tuple[int, list[str], dict]:
         providers = _probe_providers()
@@ -263,12 +272,20 @@ class LiveCollector:
                 break
             symbol = str(meta["symbol"])
             provider = str(meta["exchange"]).lower()
-            if not providers.get(provider, {}).get("reachable", False):
-                continue
+            # Attempt the real ticker request even if the fast probe failed; the
+            # data request has its own timeout and Binance host failover.
             try:
                 ticker = fetch_ticker(symbol, "spot", provider)
                 _save_ticker_snapshot(ticker, meta.to_dict())
                 received = _now_iso()
+                providers.setdefault(provider, {})
+                providers[provider].update({
+                    "provider": provider,
+                    "reachable": True,
+                    "last_success": received,
+                    "last_success_transport": ticker.get("transport", "requests"),
+                    "observed_by": "successful_ticker_request",
+                })
                 ok_symbols.append(symbol)
                 latest = received
                 failures_in_a_row = 0
@@ -292,7 +309,7 @@ class LiveCollector:
                 if failures_in_a_row >= 5:
                     log.error("Five consecutive ticker failures; ending this cycle to respect provider limits")
                     break
-            self.stop_event.wait(MIN_REQUEST_INTERVAL_SECONDS)
+            self.stop_event.wait(PROVIDER_REQUEST_INTERVAL_SECONDS.get(provider, MIN_REQUEST_INTERVAL_SECONDS))
 
         # Ticker snapshots are real, but are not candles. Refresh completed exchange
         # candles separately and keep their HISTORICAL_EXCHANGE provenance.
