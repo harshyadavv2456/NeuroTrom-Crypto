@@ -26,6 +26,7 @@ from market_data import (
     http_get,
     save_candles,
     kraken_ohlc,
+    coindcx_ohlc,
     rest_klines,
 )
 from universe import load_universe, build_universe
@@ -38,7 +39,7 @@ POLL_INTERVAL_SECONDS = 60
 MIN_REQUEST_INTERVAL_SECONDS = 0.75
 # Kraken's public REST APIs are rate-limited; keep per-provider pacing rather than
 # polling Kraken at Binance's faster cadence.
-PROVIDER_REQUEST_INTERVAL_SECONDS = {"binance": 0.75, "kraken": 1.1}
+PROVIDER_REQUEST_INTERVAL_SECONDS = {"binance": 0.75, "kraken": 1.1, "coindcx": 0.2}
 STATUS_STALE_SECONDS = 180
 CANDLE_REFRESH_SECONDS = 900
 
@@ -115,7 +116,7 @@ def _save_ticker_snapshot(ticker: dict, market_meta: dict) -> None:
 def _real_universe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "symbol" not in df.columns or "exchange" not in df.columns:
         return pd.DataFrame()
-    result = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken"])].copy()
+    result = df[df["exchange"].astype(str).str.lower().isin(["binance", "kraken", "coindcx"])].copy()
     if "universe_provenance" in result.columns:
         result = result[result["universe_provenance"].astype(str).isin([SOURCE_LIVE, SOURCE_HISTORICAL])]
     if "status" in result.columns:
@@ -127,6 +128,7 @@ def _probe_providers() -> dict:
     return {
         "binance": test_provider_connectivity("binance"),
         "kraken": test_provider_connectivity("kraken"),
+        "coindcx": test_provider_connectivity("coindcx"),
     }
 
 
@@ -237,6 +239,11 @@ class LiveCollector:
                     if not candles.empty:
                         save_candles(candles, symbol, "1h", "spot",
                                      source_mode=SOURCE_HISTORICAL, provider=provider)
+                elif provider == "coindcx":
+                    candles = coindcx_ohlc(symbol, interval="1h", limit=5)
+                    if not candles.empty:
+                        save_candles(candles, symbol, "1h", "spot",
+                                     source_mode=SOURCE_HISTORICAL, provider=provider)
             except Exception as exc:
                 log.warning("Recent candle refresh failed for %s via %s: %s", symbol, provider, exc)
             self.stop_event.wait(PROVIDER_REQUEST_INTERVAL_SECONDS.get(provider, MIN_REQUEST_INTERVAL_SECONDS))
@@ -274,27 +281,33 @@ class LiveCollector:
                 break
             symbol = str(meta["symbol"])
             provider = str(meta["exchange"]).lower()
-            # Probe failures can be transient. Try the assigned exchange first; on
-            # transport failure only, retry the same symbol on the other real provider.
-            # HTTP 4xx/429 and pair-resolution errors are not silently routed around.
+            # Probe failures can be transient. Try the assigned exchange first and,
+            # on connection failures or unavailable exact pairs, try other public providers.
+            # This path uses only unauthenticated public market-data endpoints.
             wait_provider = provider
             try:
-                try:
-                    ticker = fetch_ticker(symbol, "spot", provider)
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
-                        requests.exceptions.SSLError) as primary_exc:
-                    alternate = "kraken" if provider == "binance" else "binance"
-                    providers.setdefault(provider, {})
-                    providers[provider].update({
-                        "provider": provider,
-                        "reachable": False,
-                        "last_error": f"{type(primary_exc).__name__}: {str(primary_exc)[:180]}",
-                        "observed_by": "ticker_transport_failure",
-                    })
-                    log.warning("%s transport failed for %s; trying %s: %s",
-                                provider, symbol, alternate, primary_exc)
-                    ticker = fetch_ticker(symbol, "spot", alternate)
-                    errors.append(f"{provider}/{symbol} transport failed; using {alternate} fallback")
+                ticker = None
+                provider_errors = []
+                provider_order = [provider] + [p for p in ("binance", "kraken", "coindcx") if p != provider]
+                for candidate_provider in provider_order:
+                    try:
+                        ticker = fetch_ticker(symbol, "spot", candidate_provider)
+                        break
+                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                            requests.exceptions.SSLError, ValueError) as provider_exc:
+                        provider_errors.append(
+                            f"{candidate_provider}: {type(provider_exc).__name__}: {str(provider_exc)[:160]}"
+                        )
+                        providers.setdefault(candidate_provider, {})
+                        providers[candidate_provider].update({
+                            "provider": candidate_provider,
+                            "reachable": False,
+                            "last_error": f"{type(provider_exc).__name__}: {str(provider_exc)[:160]}",
+                            "observed_by": "ticker_request_failure",
+                        })
+                        continue
+                if ticker is None:
+                    raise requests.exceptions.ConnectionError("No public provider returned ticker: " + " | ".join(provider_errors))
                 actual_provider = str(ticker.get("provider", provider)).lower()
                 wait_provider = actual_provider
                 meta_for_save = meta.to_dict()
@@ -310,6 +323,8 @@ class LiveCollector:
                     "last_success_transport": ticker.get("transport", "requests"),
                     "observed_by": "successful_ticker_request",
                 })
+                if actual_provider != provider:
+                    errors.append(f"{provider}/{symbol} failed; live data obtained from {actual_provider}")
                 ok_symbols.append(symbol)
                 latest = received
                 failures_in_a_row = 0
