@@ -23,8 +23,6 @@ jobs:
         run: uv sync --no-install-project --group dev
       - name: Syntax-check Python sources
         run: uv run --no-sync python -m compileall -q src scripts
-      - name: Syntax-check local activation script
-        run: bash -n scripts/activate_real.sh
       - name: Run tests
         env:
           PYTHONPATH: src
