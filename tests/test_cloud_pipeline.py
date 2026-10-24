@@ -96,3 +96,25 @@ def test_forecast_journal_matures_only_after_target_candle_exists():
     assert journal[0]["directional_correct"] is True
     assert summary["matured_predictions"] == 1
     assert summary["directional_accuracy"] == 1.0
+
+
+def test_features_and_labels_do_not_bridge_missing_hourly_bars():
+    stamp = pd.to_datetime([
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T01:00:00Z",
+        "2026-01-01T10:00:00Z",
+        "2026-01-01T11:00:00Z",
+    ])
+    close = pd.Series([100.0, 101.0, 500.0, 505.0])
+    frame = pd.DataFrame({
+        "timestamp": stamp, "open": close, "high": close * 1.01,
+        "low": close * .99, "close": close, "volume": [10.0] * 4,
+        "symbol": ["BTCUSDT"] * 4,
+    })
+    features = cp.add_features(frame)
+    labels = cp.add_horizon_label(frame, 1)
+    # 01:00 -> 10:00 is a 9-hour gap, not a one-hour market return/target.
+    assert pd.isna(features.loc[2, "ret_1"])
+    assert pd.isna(labels.iloc[1])
+    assert labels.iloc[0] > 0
+    assert labels.iloc[2] > 0
