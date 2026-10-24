@@ -456,6 +456,14 @@ def train_models(data: dict[str, pd.DataFrame], tickers: dict[str, dict]) -> tup
                 current_ticker = tickers.get(symbol)
                 if current_ticker is None:
                     continue
+                input_time = pd.Timestamp(frame["timestamp"].iloc[-1])
+                if input_time.tzinfo is None:
+                    input_time = input_time.tz_localize("UTC")
+                input_age_hours = max(0.0, (utc_now() - input_time.to_pydatetime()).total_seconds() / 3600)
+                # Historical Kaggle rows can train/evaluate the model, but can never
+                # generate a forecast advertised as current when the API candle is stale.
+                if input_age_hours > 2.5:
+                    continue
                 try:
                     predicted_return = float(model.predict(feature_row[numeric_features])[0])
                 except Exception:
