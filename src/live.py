@@ -143,7 +143,10 @@ def _refresh_universe_if_needed(provider_status: dict) -> pd.DataFrame:
 
     # Do not overwrite a known-good real universe while every provider is down.
     must_refresh = current_real.empty or not current_exchanges.intersection(reachable)
-    if reachable and must_refresh:
+    # If no real universe exists yet, attempt discovery even when the fast
+    # health probes have a transient failure. The actual exchange metadata request
+    # uses the same TLS-verified requests/curl transport fallback as ticker calls.
+    if must_refresh and (reachable or current_real.empty):
         try:
             preferred_exchange = next(
                 (name for name in ("binance", "kraken", "coindcx")
