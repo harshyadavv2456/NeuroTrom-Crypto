@@ -34,60 +34,75 @@ def save_backfill_state(state: dict):
 
 
 def backfill_universe(intervals: list[str] = None, universe_limit: int = 60, days: int = 365):
-    """Backfill all symbols in the universe for given intervals."""
+    """Backfill real exchange-derived symbols using their recorded exchange."""
     if intervals is None:
         intervals = HISTORY_INTERVALS
-    
+
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    
+
     df = load_universe()
     if df.empty:
         df = build_universe(universe_limit)
-    
-    symbols = df["symbol"].tolist()[:universe_limit]
+    if df.empty or "symbol" not in df.columns:
+        return 0, ["No universe available"]
+
     state = load_backfill_state()
-    
     total = 0
     errors = []
-    
-    # Backfill spot data
     tasks = []
+
+    # Schedule provider-specific work. Demo symbols are deliberately not backfilled.
     with ThreadPoolExecutor(max_workers=MAX_BACKFILL_CONCURRENCY) as pool:
         futures = {}
-        for sym in symbols:
+        for _, record in df.head(universe_limit).iterrows():
+            sym = str(record["symbol"])
+            provider = str(record.get("exchange", "binance")).lower()
+            if provider not in {"binance", "kraken"}:
+                errors.append(f"{sym}: skipped; universe provenance is demo/unknown")
+                continue
+
             for interval in intervals:
-                key = f"{sym}_{interval}_spot"
-                if key in state.get("symbols_done", {}):
-                    prev_end = datetime.fromisoformat(state["symbols_done"][key]["end"])
-                    if prev_end >= end - timedelta(hours=2):
-                        continue
-                
-                fut = pool.submit(backfill_symbol, sym, interval, start, end, "spot")
-                futures[fut] = (sym, interval, "spot")
-        
-        for fut in as_completed(futures):
-            sym, interval, mkt = futures[fut]
+                key = f"{sym}_{interval}_spot_{provider}"
+                prev = state.get("symbols_done", {}).get(key, {})
+                try:
+                    prev_end = datetime.fromisoformat(prev["end"]) if prev.get("end") else None
+                    if prev_end and prev_end.tzinfo is None:
+                        prev_end = prev_end.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    prev_end = None
+                # Never let an earlier zero-row attempt permanently mark a symbol done.
+                if prev.get("rows", 0) > 0 and prev_end and prev_end >= end - timedelta(hours=2):
+                    continue
+
+                future = pool.submit(backfill_symbol, sym, interval, start, end, "spot", 100, provider)
+                futures[future] = (sym, interval, provider, key)
+
+        for future in as_completed(futures):
+            sym, interval, provider, key = futures[future]
             try:
-                rows = fut.result()
+                rows = int(future.result() or 0)
                 total += rows
-                key = f"{sym}_{interval}_{mkt}"
-                state.setdefault("symbols_done", {})[key] = {
-                    "end": end.isoformat(),
-                    "rows": rows,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            except Exception as e:
-                errors.append(f"{sym} {interval}: {e}")
-                log.error("Backfill error %s %s: %s", sym, interval, e)
-    
+                if rows > 0:
+                    state.setdefault("symbols_done", {})[key] = {
+                        "end": end.isoformat(),
+                        "rows": rows,
+                        "provider": provider,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                else:
+                    errors.append(f"{sym} {interval} via {provider}: no new candles returned")
+            except Exception as exc:
+                errors.append(f"{sym} {interval} via {provider}: {exc}")
+                log.error("Backfill error %s %s via %s: %s", sym, interval, provider, exc)
+
     state["last_run"] = datetime.now(timezone.utc).isoformat()
-    state["errors"] = errors[-20:]
+    state["symbols_done"] = state.get("symbols_done", {})
+    state["errors"] = errors[-100:]
     save_backfill_state(state)
-    
+
     log.info("Backfill complete: %d rows, %d errors", total, len(errors))
     return total, errors
-
 
 def backfill_fine_grain(symbols: list[str] = None, days: int = 30):
     """Backfill 1-minute data for a small set of symbols."""
