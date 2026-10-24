@@ -152,7 +152,20 @@ def status():
 
     synthetic_only = synthetic_rows > 0 and real_rows == 0
     synthetic_data_present = synthetic_rows > 0
-    active_synthetic_rows = 0  # get_candles() defaults to the production-only store
+    migration_report_path = DATA / "reports" / "synthetic_migration.json"
+    migration_report = {}
+    try:
+        migration_report = json.loads(migration_report_path.read_text())
+    except (OSError, ValueError):
+        migration_report = {}
+    storage_audit = migration_report.get("production_store_audit", {})
+    active_synthetic_rows = storage_audit.get("active_synthetic_rows")
+    active_unknown_rows = storage_audit.get("active_unknown_rows")
+    storage_isolation_ok = (
+        migration_report.get("status") == "ok"
+        and active_synthetic_rows == 0
+        and active_unknown_rows == 0
+    )
     # Models
     model_provenances = []
     for h in HORIZONS:
@@ -185,7 +198,9 @@ def status():
         except Exception:
             live_fresh = False
 
-    if not real_data_available:
+    if not storage_isolation_ok:
+        overall = "DEGRADED — production/demo storage isolation is not yet verified"
+    elif not real_data_available:
         overall = "BLOCKED — provider reachable but no verified real candles ingested" if any_provider else "BLOCKED — no real data provider reachable"
     elif not live_fresh:
         overall = "DEGRADED — real historical data exists, live collector is not fresh"
@@ -205,6 +220,9 @@ def status():
         "synthetic_rows": synthetic_rows,
         "synthetic_archive_rows": synthetic_rows,
         "active_synthetic_rows": active_synthetic_rows,
+        "active_unknown_rows": active_unknown_rows,
+        "storage_isolation_ok": storage_isolation_ok,
+        "storage_migration_status": migration_report.get("status", "not_run"),
         "unknown_provenance_rows": unknown_rows,
         "synthetic_only": synthetic_only,
         "synthetic_data_present": synthetic_data_present,
