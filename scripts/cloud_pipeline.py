@@ -206,7 +206,17 @@ def load_kaggle_source() -> tuple[dict, dict[str, pd.DataFrame]]:
         from kaggle.api.kaggle_api_extended import KaggleApi
         api = KaggleApi()
         api.authenticate()
-        meta = api.dataset_view(KAGGLE_REF)
+        # kaggle-cli 2.x removed KaggleApi.dataset_view(); dataset_list with an
+        # owner+search query returns the same license/freshness metadata fields.
+        owner_slug, _, dataset_slug = KAGGLE_REF.partition("/")
+        meta = None
+        for candidate in (api.dataset_list(user=owner_slug, search=dataset_slug) or []):
+            if str(getattr(candidate, "ref", "") or "").lower() == KAGGLE_REF.lower():
+                meta = candidate
+                break
+        if meta is None:
+            status.update(status="skipped", reason=f"Dataset {KAGGLE_REF} was not found via the Kaggle API; no files were downloaded or used.")
+            return status, {}
         license_name = str(getattr(meta, "licenseName", "") or getattr(meta, "license_name", "") or "")
         updated_at = parse_kaggle_updated(meta)
         status["license"] = license_name or "unknown"
