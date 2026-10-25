@@ -165,7 +165,8 @@ jobs:
               str(data.get("datasetSlug", "") or data.get("slug", "")).strip().lower(),
           )
           if actual_id != expected and actual_ref != expected:
-              raise SystemExit(f"Metadata dataset id mismatch: got {actual_id or actual_ref!r}, expected {expected!r}")
+              shape = sorted(data.keys()) if isinstance(data, dict) else type(data).__name__
+              raise SystemExit(f"Metadata dataset id mismatch: got {actual_id or actual_ref!r}, expected {expected!r}; parsed shape: {shape}")
           # kaggle-cli 2.x downloads metadata without the "id" field that its own
           # `datasets version` command requires; inject it and normalise encoding.
           data["id"] = expected
