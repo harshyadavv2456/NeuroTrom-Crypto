@@ -154,9 +154,16 @@ jobs:
           from pathlib import Path
           path = Path(sys.argv[1])
           data = json.loads(path.read_text())
-          if isinstance(data, str):
-              # kaggle-cli 2.x writes the metadata file double-encoded.
-              data = json.loads(data)
+          # kaggle-cli metadata files have been observed as plain dicts,
+          # double-encoded JSON strings, and {"info": ...} wrappers depending
+          # on the installed CLI version. Normalise all of those shapes.
+          for _ in range(4):
+              if isinstance(data, str):
+                  data = json.loads(data)
+              elif isinstance(data, dict) and set(data.keys()) == {"info"}:
+                  data = data["info"]
+              else:
+                  break
           expected = sys.argv[2].strip().lower()
           owner, _, slug = expected.partition("/")
           actual_id = str(data.get("id", "")).strip().lower()
