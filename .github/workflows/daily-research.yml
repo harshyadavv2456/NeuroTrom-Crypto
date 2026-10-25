@@ -153,11 +153,23 @@ jobs:
           import json, sys
           from pathlib import Path
           path = Path(sys.argv[1])
-          expected = sys.argv[2].strip().lower()
           data = json.loads(path.read_text())
-          actual = str(data.get("id", "")).strip().lower()
-          if actual != expected:
-              raise SystemExit(f"Metadata dataset id mismatch: got {actual!r}, expected {expected!r}")
+          if isinstance(data, str):
+              # kaggle-cli 2.x writes the metadata file double-encoded.
+              data = json.loads(data)
+          expected = sys.argv[2].strip().lower()
+          owner, _, slug = expected.partition("/")
+          actual_id = str(data.get("id", "")).strip().lower()
+          actual_ref = "{}/{}".format(
+              str(data.get("ownerUser", "") or data.get("owner", "")).strip().lower(),
+              str(data.get("datasetSlug", "") or data.get("slug", "")).strip().lower(),
+          )
+          if actual_id != expected and actual_ref != expected:
+              raise SystemExit(f"Metadata dataset id mismatch: got {actual_id or actual_ref!r}, expected {expected!r}")
+          # kaggle-cli 2.x downloads metadata without the "id" field that its own
+          # `datasets version` command requires; inject it and normalise encoding.
+          data["id"] = expected
+          path.write_text(json.dumps(data, indent=2))
           PY
           cp site/data/daily_update.csv "$tmp/daily_update.csv"
           kaggle datasets version -p "$tmp" -m "Automated market snapshot ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:8})" -q -t -r skip
